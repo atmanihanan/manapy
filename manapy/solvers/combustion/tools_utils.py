@@ -1,0 +1,2600 @@
+from numba import njit
+import numpy as np
+from scipy.optimize import newton
+import meshio 
+from scipy import optimize
+#from manapy.solution_refcsv.ref import interpo, initialize_multiple_interpolations
+
+######################################exact_solution##############################"
+@njit
+def f(p:'float', alpha:'float', pl:'float', pr:'float', al:'float', ar:'float', rl:'float', rr:'float', gamma:'float'):
+    if alpha == 1:
+        p_alpha = pl
+        a_alpha = al
+        A_alpha = 2. / (rl * (gamma + 1.))
+        B_alpha = (gamma - 1.) / (gamma + 1.) * pl
+    elif alpha == 2:
+        p_alpha = pr
+        a_alpha = ar
+        A_alpha = 2. / (rr * (gamma + 1.))
+        B_alpha = (gamma - 1.) / (gamma + 1.) * pr
+    else:
+        raise ValueError("Invalid alpha value. Must be 'L' or 'R'")
+
+    if p > p_alpha:
+        return (p - p_alpha) * np.sqrt(A_alpha / (p + B_alpha))
+    else:
+        return 2. * a_alpha / (gamma - 1.) * ((p / p_alpha) ** ((gamma - 1.) / (2. * gamma)) - 1.)
+
+@njit
+def g(w:'float', ul:'float', ur:'float', pl:'float', pr:'float', al:'float', ar:'float', rl:'float', rr:'float', gamma:'float'):
+    return f(w, 1, pl, pr, al, ar, rl, rr, gamma) + f(w, 2, pl, pr, al, ar, rl, rr, gamma) + ur - ul
+@njit
+def dichotomie(bas:'float', haut:'float', ul:'float', ur:'float', pl:'float', pr:'float', al:'float', ar:'float', rl:'float', rr:'float', gamma:'float'):
+    lower, upper = bas, haut
+    while g(lower, ul, ur, pl, pr, al, ar, rl, rr, gamma) * g(upper, ul, ur, pl, pr, al, ar, rl, rr, gamma) > 0:
+        upper = 2.0 * upper
+
+    while upper - lower > 1e-8:
+        middle = 0.5 * (upper + lower)
+        if g(middle, ul, ur, pl, pr, al, ar, rl, rr, gamma) > 0:
+            lower, upper = lower, middle
+        else:
+            lower, upper = middle, upper
+
+    return 0.5 * (upper + lower)
+@njit
+def Exact_E(N:'float', x:'float', t:'float', x_0:'float', xmax:'float', gamma:'float', rl:'float', rr:'float', ul:'float', ur:'float', pl:'float', pr:'float'):
+    r = np.zeros(N)  
+    p = np.zeros(N) 
+    u = np.zeros(N)  
+
+    al = np.sqrt(gamma * pl / rl)
+    ar = np.sqrt(gamma * pr / rr)
+    p_star = dichotomie(0.0, max(pl, pr), ul, ur, pl, pr, al, ar, rl, rr, gamma)
+    u_star = (ul + ur + f(p_star, 2, pl, pr, al, ar, rl, rr, gamma) - f(p_star, 1, pl, pr, al, ar, rl, rr, gamma)) * 0.5
+
+    if p_star > pl:
+        r_star_l = rl * (p_star / pl + (gamma - 1.) / (gamma + 1.)) / ((gamma - 1.) / (gamma + 1.) * p_star / pl + 1.)
+    else:
+        r_star_l = rl * (p_star / pl) ** (1. / gamma)
+
+    a_star_l = al * (p_star / pl) ** ((gamma - 1.) / (2. * gamma))
+    sigma_l = ul - al * np.sqrt((gamma + 1.) / (2. * gamma) * (p_star / pl) + (gamma - 1.) / (2. * gamma))
+    sigma_H_l = ul - al
+    sigma_T_l = u_star - a_star_l
+
+    if p_star > pr:
+        r_star_r = rr * (p_star / pr + (gamma - 1.) / (gamma + 1.)) / ((gamma - 1.) / (gamma + 1.) * (p_star / pr) + 1.)
+    else:
+        r_star_r = rr * (p_star / pr) ** (1. / gamma)
+
+    a_star_r = ar * (p_star / pr) ** ((gamma - 1.) / (2. * gamma))
+    sigma_r = ur + ar * np.sqrt((gamma + 1.) / (2. * gamma) * (p_star / pr) + (gamma - 1.) / (2. * gamma))
+    sigma_H_r = ur + ar
+    sigma_T_r = u_star + a_star_r
+
+    for i in range(N):
+        if p_star > pl:  # Gauche = choc
+            if x[i] - xmax * x_0 < sigma_l * t:
+                r[i], p[i], u[i] = rl, pl, ul
+            elif sigma_l * t <= x[i] - xmax * x_0 <= u_star * t:
+                r[i], p[i], u[i] = r_star_l, p_star, u_star
+        else:  # Gauche = detente
+            if x[i] - xmax * x_0 < sigma_H_l * t:
+                r[i], p[i], u[i] = rl, pl, ul
+            elif sigma_H_l * t <= x[i] - xmax * x_0 < sigma_T_l * t:
+                r[i] = rl * (2. / (gamma + 1.) + (gamma - 1.) / ((gamma + 1.) * al) * (ul - (x[i] - x_0) / t)) ** (2. / (gamma - 1.))
+                p[i] = pl * (2. / (gamma + 1.) + (gamma - 1.) / ((gamma + 1.) * al) * (ul - (x[i] - x_0) / t)) ** (2. * gamma / (gamma - 1.))
+                u[i] = 2. / (gamma + 1.) * (al + (gamma - 1.) * 0.5 * ul + (x[i] - x_0) / t)
+            elif sigma_T_l * t <= x[i] - xmax * x_0 <= u_star * t:
+                r[i], p[i], u[i] = r_star_l, p_star, u_star
+
+        if p_star > pr:  # Droite = choc
+            if x[i] - xmax * x_0 > sigma_r * t:
+                r[i], p[i], u[i] = rr, pr, ur
+            elif u_star * t <= x[i] - xmax * x_0 <= sigma_r * t:
+                r[i], p[i], u[i] = r_star_r, p_star, u_star
+        else:  # Droite = detente
+            if x[i] - xmax * x_0 > sigma_H_r * t:
+                r[i], p[i], u[i] = rr, pr, ur
+            elif sigma_T_r * t < x[i] - xmax * x_0 <= sigma_H_r * t:
+                r[i] = rr * (2. / (gamma + 1.) - (gamma - 1.) / ((gamma + 1.) * ar) * (ur - (x[i] - x_0) / t)) ** (2. / (gamma - 1.))
+                p[i] = pr * (2. / (gamma + 1.) - (gamma - 1.) / ((gamma + 1.) * ar) * (ur - (x[i] - x_0) / t)) ** (2. * gamma / (gamma - 1.))
+                u[i] = 2. / (gamma + 1.) * (-ar + (gamma - 1.) * 0.5 * ur + (x[i] - x_0) / t)
+            elif u_star * t <= x[i] - xmax * x_0 <= sigma_T_r * t:
+                r[i], p[i], u[i] = r_star_r, p_star, u_star
+
+    return r, u, p
+
+
+
+@njit
+def Exact_Euler(rho_exact:'float[:]', u_exact:'float[:]', E_exact:'float[:]',e_internal_exact:'float[:]', P_exact:'float[:]', center:'float[:,:]',rl:'float',
+                pl:'float', ul:'float',rr:'float', pr:'float',ur:'float',x_0:'flaot',xmin:'float', xmax:'float',time:'float', gamma='float'):
+
+    nbelement=len(center)
+    #x=np.linspace(xmin,xmax,N)
+    x=[center[i][0]for i in range(nbelement)]
+    r, u, p = Exact_E(nbelement, x, time, x_0, xmax, gamma, rl, rr, ul, ur, pl, pr)
+    for i in range(nbelement):
+        rho_exact[i] = r[i]
+        u_exact[i]=  u[i] 
+        e_internal_exact[i] = p[i] / (r[i] * (gamma - 1.))
+        E_exact[i]=  (0.5 * u[i]**2)/r[i] + p[i] / (r[i] * (gamma - 1.))
+        P_exact[i]=p[i]
+
+
+################################### norms to compute error #######################""
+
+@njit
+def norm_L1(rho_exact:'float[:]', u_exact:'float[:]', E_exact:'float[:]', 
+            rho:'float[:]', rhou:'float[:]', rhoE:'float[:]', 
+            center:'float[:,:]', vol:'float[:]'):
+    Err_rho = 0.0  
+    Err_rhou = 0.0  
+    Err_rhoE = 0.0  
+    relative_rho=0.0
+    relative_rhou=0.0
+    relative_rhoE=0.0
+
+    nbelement = len(center)
+
+    for i in range(nbelement):
+        Err_rho += vol[i] * np.abs(rho_exact[i] - rho[i])
+        Err_rhou += vol[i] * np.abs(rho_exact[i] * u_exact[i] - rhou[i]) 
+        Err_rhoE += vol[i] *   np.abs(rho_exact[i] * E_exact[i] - rhoE[i])
+
+        relative_rho+=vol[i]*np.abs(rho_exact[i])
+        relative_rhou+=vol[i]*np.abs(rho_exact[i]*u_exact[i])
+        relative_rhoE+=vol[i]*np.abs(rho_exact[i]*E_exact[i])
+    
+
+    Err_rho=Err_rho/  relative_rho
+    Err_rhou=Err_rhou/  relative_rhou
+    Err_rhoE=Err_rhoE/  relative_rhoE
+
+    print(" relative L1 error in rho is:", Err_rho)
+    print("relative  L1 error in rhou is:", Err_rhou)
+    print(" relative L1 error in rhoE is:", Err_rhoE)
+   
+
+@njit
+def norm_Linf(rho_exact:'float[:]', u_exact:'float[:]', E_exact:'float[:]', 
+              rho:'float[:]', rhou:'float[:]', rhoE:'float[:]', 
+              center:'float[:,:]', vol:'float[:]'):
+    nbelement = len(center)
+    Err_rho  = 0.0  
+    Err_rhou=0.0
+    Err_rhoE=0.0
+   
+
+    for i in range(nbelement):
+        
+        Err_rho = max(np.abs(rho_exact[i] - rho[i]),Err_rho) 
+        Err_rhou = max(np.abs(rho_exact[i]*u_exact[i] - rhou[i]),Err_rhou) 
+        Err_rhoE = max(np.abs(rho_exact[i]*E_exact[i] - rhoE[i]),Err_rhoE) 
+        
+
+      
+    print("The L_infinity error in rho is", Err_rho)
+    print("The L_infinity error in rhou is", Err_rhou)
+    print("The L_infinity error in rhoE is", Err_rhoE)
+
+'''
+# Charger le fichier et initialiser les interpolations
+csv_file ="/home/asus/manapy/manapy/solution_refcsv/ref_allvar.csv"
+initialize_multiple_interpolations(csv_file, variables=["rho", "u", "E", "e_internal", "p"])
+
+
+
+def Exact(rho_exact:'float[:]', u_exact:'float[:]', E_exact:'float[:]',e_internal_exact:'float[:]', P_exact:'float[:]', center:'float[:,:]'):
+
+    nbelement=len(center)
+    for i in range (nbelement):
+
+        rho_exact[i]=interpo("rho",center[i][0],center[i][1])
+        u_exact[i]=interpo("u",center[i][0],center[i][1])
+        E_exact[i]=interpo("E",center[i][0],center[i][1])
+        e_internal_exact[i]=interpo("e_internal",center[i][0],center[i][1])
+        P_exact[i]=interpo("p",center[i][0],center[i][1])
+
+
+'''
+
+
+################################test11#####################################
+
+
+
+@njit
+def initialisation_tubeChok11exac(rho_exact:'float[:]', u_exact:'float[:]', E_exact:'float[:]', e_internal_exact:'float[:]', P_exact:'float[:]', center:'float[:,:]', gamma:'float'):
+
+    nbelements = len(center)
+    
+    for i in range(nbelements):
+        xcent = center[i][0]
+        #print(xcent)
+        if xcent< 0.5:
+            rho_exact[i]=6
+            u_exact[i]=19.6
+            P_exact[i]=460
+            E_exact[i]=(P_exact[i]/(gamma-1) +0.5*(u_exact[i]**2))/rho_exact[i]
+            e_internal_exact[i]=P_exact[i]/((gamma-1)*rho_exact[i] )
+        else:
+            rho_exact[i]=6
+            u_exact[i]=-6.2
+            P_exact[i]=46
+            E_exact[i]=(P_exact[i]/(gamma-1) +0.5*(u_exact[i]**2))/rho_exact[i]
+            e_internal_exact[i]=P_exact[i]/((gamma-1)*rho_exact[i] )
+
+
+
+@njit
+def initialisation_tubeChok11(rho:'float[:]', rhou:'float[:]', rhov:'float[:]', rhoE:'float[:]',e_internal:'float[:]', P:'float[:]', center:'float[:,:]', gamma='float'):
+   
+    nbelements = len(center)
+    
+    for i in range(nbelements):
+        xcent = center[i][0]
+        #print(xcent)
+        if xcent< 0.5:
+            rho[i]=6
+            rhou[i]=19.6
+            rhov[i]=0
+            P[i]=460
+            rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+            e_internal[i]=P[i]/((gamma-1)*rho[i] )
+        else:
+            rho[i]=6
+            rhou[i]=-6.2
+            rhov[i]=0
+            P[i]=46
+            rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+            e_internal[i]=P[i]/((gamma-1)*rho[i] )
+
+
+
+############################################################test22##############################################################
+@njit
+def initialisation_tubeChok22(rho:'float[:]', rhou:'float[:]', rhov:'float[:]', rhoE:'float[:]',e_internal:'float[:]', P:'float[:]', center:'float[:,:]', gamma='float'):
+   
+    nbelements = len(center)
+    
+    for i in range(nbelements):
+        xcent = center[i][0]
+        #print(xcent)
+        if xcent< 0.5:
+            rho[i]=1
+            rhou[i]=0
+            rhov[i]=0
+            P[i]=1
+            rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+            e_internal[i]=P[i]/((gamma-1)*rho[i] )
+        else:
+            rho[i]=0.125
+            rhou[i]=0
+            rhov[i]=0
+            P[i]=0.1
+            rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+            e_internal[i]=P[i]/((gamma-1)*rho[i] )
+
+
+@njit
+def initialisation_tubeChok22exac(rho_exact:'float[:]', u_exact:'float[:]', E_exact:'float[:]', e_internal_exact:'float[:]', P_exact:'float[:]', center:'float[:,:]', gamma:'float'):
+
+    nbelements = len(center)
+    
+    for i in range(nbelements):
+        xcent = center[i][0]
+        #print(xcent)
+        if xcent< 0.5:
+            rho_exact[i]=1
+            u_exact[i]=0
+            P_exact[i]=1
+            E_exact[i]=(P_exact[i]/(gamma-1) +0.5*(u_exact[i]**2))/rho_exact[i]
+            e_internal_exact[i]=P_exact[i]/((gamma-1)*rho_exact[i] )
+        else:
+            rho_exact[i]=0.125
+            u_exact[i]=0
+            P_exact[i]=0.1
+            E_exact[i]=(P_exact[i]/(gamma-1) +0.5*(u_exact[i]**2))/rho_exact[i]
+            e_internal_exact[i]=P_exact[i]/((gamma-1)*rho_exact[i] )
+
+
+
+
+######################################test1#######################################
+@njit
+def initialisation_tubeChok1(rho:'float[:]', rhou:'float[:]', rhov:'float[:]', rhoE:'float[:]',e_internal:'float[:]', P:'float[:]', center:'float[:,:]', gamma='float'):
+   
+    nbelements = len(center)
+    
+    for i in range(nbelements):
+        xcent = center[i][0]
+        #print(xcent)
+        if xcent< 0.5:
+            rho[i]=1
+            rhou[i]=0.75
+            rhov[i]=0
+            P[i]=1
+            rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+            e_internal[i]=P[i]/((gamma-1)*rho[i] )
+        else:
+            rho[i]=0.125
+            rhou[i]=0
+            rhov[i]=0
+            P[i]=0.1
+            rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+            e_internal[i]=P[i]/((gamma-1)*rho[i] )
+
+
+@njit
+def initialisation_tubeChok1exac(rho_exact:'float[:]', u_exact:'float[:]', E_exact:'float[:]', e_internal_exact:'float[:]', P_exact:'float[:]', center:'float[:,:]', gamma:'float'):
+
+    nbelements = len(center)
+    
+    for i in range(nbelements):
+        xcent = center[i][0]
+        #print(xcent)
+        if xcent< 0.5:
+            rho_exact[i]=1
+            u_exact[i]=0.75
+            P_exact[i]=1
+            E_exact[i]=(P_exact[i]/(gamma-1) +0.5*(u_exact[i]**2))/rho_exact[i]
+            e_internal_exact[i]=P_exact[i]/((gamma-1)*rho_exact[i] )
+        else:
+            rho_exact[i]=0.125
+            u_exact[i]=0
+            P_exact[i]=0.1
+            E_exact[i]=(P_exact[i]/(gamma-1) +0.5*(u_exact[i]**2))/rho_exact[i]
+            e_internal_exact[i]=P_exact[i]/((gamma-1)*rho_exact[i] )
+
+  
+
+
+######################################test2#######################################
+
+@njit
+def initialisation_tubeChok2(rho:'float[:]', rhou:'float[:]', rhov:'float[:]', rhoE:'float[:]',e_internal:'float[:]', P:'float[:]', center:'float[:,:]', gamma='float'):
+   
+    nbelements = len(center)
+    
+    for i in range(nbelements):
+        xcent = center[i][0]
+        #print(xcent)
+        if xcent< 0.5:
+            rho[i]=1
+            rhou[i]=0.0
+            rhov[i]=0.0
+            P[i]=10
+            rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+            e_internal[i]=P[i]/((gamma-1)*rho[i] )
+        else:
+            rho[i]=0.125
+            rhou[i]=0
+            rhov[i]=0
+            P[i]=1.0
+            rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+            e_internal[i]=P[i]/((gamma-1)*rho[i] )
+
+
+@njit
+def initialisation_tubeChok2exac(rho_exact:'float[:]', u_exact:'float[:]', E_exact:'float[:]', e_internal_exact:'float[:]', P_exact:'float[:]', center:'float[:,:]', gamma:'float'):
+
+    nbelements = len(center)
+    
+    for i in range(nbelements):
+        xcent = center[i][0]
+        #print(xcent)
+        if xcent< 0.5:
+            rho_exact[i]=1
+            u_exact[i]=0.0
+            P_exact[i]=10
+            E_exact[i]=(P_exact[i]/(gamma-1) +0.5*(u_exact[i]**2))/rho_exact[i]
+            e_internal_exact[i]=P_exact[i]/((gamma-1)*rho_exact[i] )
+        else:
+            rho_exact[i]=0.125
+            u_exact[i]=0.0
+            P_exact[i]=1.0
+            E_exact[i]=(P_exact[i]/(gamma-1) +0.5*(u_exact[i]**2))/rho_exact[i]
+            e_internal_exact[i]=P_exact[i]/((gamma-1)*rho_exact[i] )
+
+  
+
+
+########################################test3##########################################
+@njit
+def initialisation_tubeChok3(rho:'float[:]', rhou:'float[:]', rhov:'float[:]', rhoE:'float[:]',e_internal:'float[:]', P:'float[:]', center:'float[:,:]', gamma='float'):
+   
+    nbelements = len(center)
+    
+    for i in range(nbelements):
+        xcent = center[i][0]
+        #print(xcent)
+        if xcent< 0.5:
+            rho[i]=0.445
+            rhou[i]=0.31061  #u=0.698
+            rhov[i]=0
+            P[i]=3.258
+            rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+            e_internal[i]=P[i]/((gamma-1)*rho[i] )
+        else:
+            rho[i]=0.5
+            rhou[i]=0
+            rhov[i]=0
+            P[i]=0.571
+            rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+            e_internal[i]=P[i]/((gamma-1)*rho[i] )
+
+
+@njit
+def initialisation_tubeChok3exac(rho_exact:'float[:]', u_exact:'float[:]', E_exact:'float[:]', e_internal_exact:'float[:]', P_exact:'float[:]', center:'float[:,:]', gamma:'float'):
+
+    nbelements = len(center)
+    
+    for i in range(nbelements):
+        xcent = center[i][0]
+        #print(xcent)
+        if xcent< 0.5:
+            rho_exact[i]=0.445
+            u_exact[i]=0.31061
+            P_exact[i]=3.258
+            E_exact[i]=(P_exact[i]/(gamma-1) +0.5*(u_exact[i]**2))/rho_exact[i]
+            e_internal_exact[i]=P_exact[i]/((gamma-1)*rho_exact[i] )
+        else:
+            rho_exact[i]=0.5
+            u_exact[i]=0
+            P_exact[i]=0.571
+            E_exact[i]=(P_exact[i]/(gamma-1) +0.5*(u_exact[i]**2))/rho_exact[i]
+            e_internal_exact[i]=P_exact[i]/((gamma-1)*rho_exact[i] )
+
+  
+
+
+    ########################################test4##########################################
+
+
+@njit
+def initialisation_tubeChok4(rho:'float[:]', rhou:'float[:]', rhov:'float[:]', rhoE:'float[:]',e_internal:'float[:]', P:'float[:]', center:'float[:,:]', gamma='float'):
+   
+    nbelements = len(center)
+    
+    for i in range(nbelements):
+        xcent = center[i][0]
+        #print(xcent)
+        if xcent< 0.5:
+            rho[i]=1
+            rhou[i]=-2
+            rhov[i]=0
+            P[i]=0.4
+            rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+            e_internal[i]=P[i]/((gamma-1)*rho[i] )
+        else:
+            rho[i]=1
+            rhou[i]=2
+            rhov[i]=0
+            P[i]=0.4
+            rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+            e_internal[i]=P[i]/((gamma-1)*rho[i] )
+
+@njit
+def initialisation_tubeChok4exac(rho_exact:'float[:]', u_exact:'float[:]', E_exact:'float[:]', e_internal_exact:'float[:]', P_exact:'float[:]', center:'float[:,:]', gamma:'float'):
+
+    nbelements = len(center)
+    
+    for i in range(nbelements):
+        xcent = center[i][0]
+        #print(xcent)
+        if xcent< 0.5:
+            rho_exact[i]=1
+            u_exact[i]=-2
+            P_exact[i]=0.4
+            E_exact[i]=(P_exact[i]/(gamma-1) +0.5*(u_exact[i]**2))/rho_exact[i]
+            e_internal_exact[i]=P_exact[i]/((gamma-1)*rho_exact[i] )
+        else:
+            rho_exact[i]=1
+            u_exact[i]=2
+            P_exact[i]=0.4
+            E_exact[i]=(P_exact[i]/(gamma-1) +0.5*(u_exact[i]**2))/rho_exact[i]
+            e_internal_exact[i]=P_exact[i]/((gamma-1)*rho_exact[i] )
+
+
+
+###########################################compute the h ##########################################
+def step(vol:'float[:]', nbcells:'float64'):
+    s=0
+    N=int(nbcells)
+  
+    for i in range(N):
+        s+=vol[i]
+    h=np.sqrt(s/N)
+    return h
+    
+def compute_p(h1:'float', h2:'float', error1:'float', error2:'float'):
+        """Calcule l'ordre de convergence entre deux maillages."""
+        return (np.log(error1) - np.log(error2)) / (np.log(h1) - np.log(h2))
+
+
+
+
+##############################radially symmetric  Riemann problrm #####################################
+@njit
+def initialisation_RS(rho:'float[:]', rhou:'float[:]', rhov:'float[:]', rhoE:'float[:]',e_internal:'float[:]', P:'float[:]', center:'float[:,:]', gamma='float'):
+   
+    nbelements = len(center)
+    for i in range(nbelements):
+        xcent = center[i][0]
+        ycent = center[i][1]
+        #print(xcent)
+        if np.sqrt(xcent**2+ycent**2)< 0.13:
+            rho[i]=2.0
+            rhou[i]=0
+            rhov[i]=0
+            P[i]=15.0
+            rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+            e_internal[i]=P[i]/((gamma-1)*rho[i] )
+        else:
+            rho[i]=1.0
+            rhou[i]=0
+            rhov[i]=0
+            P[i]=1.0
+            rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+            e_internal[i]=P[i]/((gamma-1)*rho[i] )
+
+
+
+##############################Double Mach reflection problem#####################################
+@njit
+def initialisation_DMR(rho:'float[:]', rhou:'float[:]', rhov:'float[:]', rhoE:'float[:]',e_internal:'float[:]', P:'float[:]', center:'float[:,:]', gamma='float'):
+   
+    nbelements = len(center)
+    
+    for i in range(nbelements):
+        xcent = center[i][0]
+        ycent = center[i][1]
+        k= (1/6)+ ycent/(np.sqrt(3))
+        #print(xcent)
+        if xcent<k:
+            rho[i]=8.0
+            rhou[i]=8.0*8.25*(np.sqrt(3)/2)
+            rhov[i]=-8.0*8.25*0.5
+            P[i]=116.5
+            rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+            e_internal[i]=P[i]/((gamma-1)*rho[i] )
+        else:
+            rho[i]=1.4
+            rhou[i]=0.0
+            rhov[i]=0.0
+            P[i]=1.0
+            rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+            e_internal[i]=P[i]/((gamma-1)*rho[i] )
+
+
+
+
+#######################GAMM channel##################
+@njit
+def GAMM_channel(rho:'float[:]', rhou:'float[:]', rhov:'float[:]', rhoE:'float[:]',e_internal:'float[:]', P:'float[:]', center:'float[:,:]', gamma='float'):
+
+    nbelements = len(rho)
+
+    for i in range(nbelements):
+        rho[i]   = 1.0948
+        P[i]     = 90808.0041
+        rhou[i]  = 0.
+        rhov[i]  = 0.
+        rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+        e_internal[i]=P[i]/((gamma-1)*rho[i] )
+
+    
+#########################conditions au bord##############################
+@njit
+def ghost_value_slip(rhou_c:'float[:]', rhov_c:'float[:]',rho_c:'float[:]', w_ghost:'float[:]', 
+                     cellid:'int32[:,:]', faces:'int32[:]', normal:'float[:,:]', mesure:'float[:]',choix:'int32'):
+
+    s_n = np.zeros(3)
+    for i in faces:
+        u_i = rhou_c[cellid[i][0]]/rho_c[cellid[i][0]]
+        v_i = rhov_c[cellid[i][0]]/rho_c[cellid[i][0]]
+        
+        s_n[:] = normal[i][:] / mesure[i]
+        u_g = u_i*(s_n[1]*s_n[1] - s_n[0]*s_n[0]) - 2.0*v_i*s_n[0]*s_n[1]
+        v_g = v_i*(s_n[0]*s_n[0] - s_n[1]*s_n[1]) - 2.0*u_i*s_n[0]*s_n[1]
+        if choix==1:
+            w_ghost[i] =rho_c[cellid[i][0]]* u_g
+        else:
+            w_ghost[i] =rho_c[cellid[i][0]]* v_g
+            
+
+
+        
+        
+@njit
+def ghost_value_neumann(w_c:'float[:]', w_ghost:'float[:]', cellid:'int32[:,:]', faces:'uint32[:]'):
+    
+    for i in faces:
+        w_ghost[i]  = w_c[cellid[i][0]]
+        
+@njit    
+def ghost_value_neumannNH(w_c:'float[:]', w_ghost:'float[:]', cellid:'int32[:,:]', faces:'uint32[:]',
+                          cst:'float[:]', dist:'float[:]'):
+    for i in faces:
+        w_ghost[i] = w_c[cellid[i][0]] + cst[i]*dist[i]
+
+@njit
+def ghost_value_dirichlet(value:'float', w_ghost:'float[:]', faces:'uint32[:]'):
+    
+    for i in faces:
+        w_ghost[i]  = value
+#################################halo value############################"
+# 
+################################### halo values#############################
+def haloghost_value_neumann(w_halo:'float[:]', w_haloghost:'float[:]', haloghostcenter:'float[:,:,:]',
+                            BCindex: 'int32', halonodes:'uint32[:]',  cst:'float[:]'):
+    
+    for i in halonodes:
+        for j in range(len(haloghostcenter[i])):
+            if haloghostcenter[i][j][-1] != -1:
+                if haloghostcenter[i][j][-2] == BCindex:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+    
+                    w_haloghost[cellghost]   = w_halo[cellhalo]
+
+def haloghost_value_neumannNH(w_halo:'float[:]', w_haloghost:'float[:]', haloghostcenter:'float[:,:,:]',
+                            BCindex: 'int32', halonodes:'uint32[:]',  cst:'float[:]'):
+    
+    #TODO dist is not well computed (work only if NH is in the infaces)
+    for i in halonodes:
+        for j in range(len(haloghostcenter[i])):
+            if haloghostcenter[i][j][-1] != -1:
+                if haloghostcenter[i][j][-2] == BCindex:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                    dist = 2*distance(haloghostcenter[i][j][0:2], np.array([0., haloghostcenter[i][j][1]]))
+    
+                    w_haloghost[cellghost]   = w_halo[cellhalo] + cst[i]*dist
+
+def haloghost_value_dirichlet(value:'float[:]', w_haloghost:'float[:]', haloghostcenter:'float[:,:,:]',
+                              BCindex: 'int32', halonodes:'uint32[:]',  cst:'float[:]'):
+    
+    for i in halonodes:
+        for j in range(len(haloghostcenter[i])):
+            if haloghostcenter[i][j][-1] != -1:
+                if haloghostcenter[i][j][-2] == BCindex:
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                    w_haloghost[cellghost]   = value[cellghost]
+
+def haloghost_value_nonslip(w_halo:'float[:]', w_haloghost:'float[:]', haloghostcenter:'float[:,:,:]',
+                           BCindex: 'int32', halonodes:'uint32[:]',  cst:'float[:]'):
+    
+    for i in halonodes:
+        for j in range(len(haloghostcenter[i])):
+            if haloghostcenter[i][j][-1] != -1:
+                if haloghostcenter[i][j][-2] == BCindex:
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                    w_haloghost[cellghost]   = -1*w_halo[cellghost]
+
+
+def haloghost_value_slip(u_halo:'float[:]', v_halo:'float[:]', w_haloghost:'float[:]', haloghostcenter:'float[:,:,:]',
+                       BCindex: 'int32', halonodes:'int32[:]', haloghostfaceinfo:'float[:,:,:]'):
+    
+    s_n = np.zeros(2)
+    for i in halonodes:
+        for j in range(len(haloghostcenter[i])):
+            if haloghostcenter[i][j][-1] != -1:
+                if haloghostcenter[i][j][-2] == BCindex:
+                    cellghost = int32(haloghostcenter[i][j][-1])
+
+                    u_i = u_halo[cellghost]
+                    v_i = v_halo[cellghost]
+                    
+                    mesure = np.sqrt(haloghostfaceinfo[i][j][2]**2 + haloghostfaceinfo[i][j][3]**2)# + haloghostfaceinfo[i][5]**2)
+                    
+                    s_n[0] = haloghostfaceinfo[i][j][2] / mesure
+                    s_n[1] = haloghostfaceinfo[i][j][3] / mesure
+                    
+                    u_g = u_i*(s_n[1]*s_n[1] - s_n[0]*s_n[0]) - 2.0*v_i*s_n[0]*s_n[1]
+                        
+                    w_haloghost[i] = u_halo[cellghost] * u_g
+
+
+'''
+def ghost_value(w_c, w_ghost, cellid, name, normal, mesure):
+
+    nbface = len(cellid)
+    
+    for i in range(nbface):
+        if name[i] == 1 or name[i] == 2:
+            #condition Neumann
+            w_ghost[i].hu = w_c[cellid[i][0]].hu
+            w_ghost[i].hv = w_c[cellid[i][0]].hv
+            w_ghost[i].h  = w_c[cellid[i][0]].h
+            w_ghost[i].Z  = w_c[cellid[i][0]].Z
+            w_ghost[i].hc = w_c[cellid[i][0]].hc
+        
+        if name[i] == 3 or name[i] == 4:
+        #slip conditions
+            u_i = w_c[cellid[i][0]].hu/w_c[cellid[i][0]].h
+            v_i = w_c[cellid[i][0]].hv/w_c[cellid[i][0]].h
+        
+            s_n = normal[i] / mesure[i]
+        
+            u_g = u_i*(s_n[1]*s_n[1] - s_n[0]*s_n[0]) - 2.0*v_i*s_n[0]*s_n[1]
+            v_g = v_i*(s_n[0]*s_n[0] - s_n[1]*s_n[1]) - 2.0*u_i*s_n[0]*s_n[1]
+        
+            w_ghost[i].h = w_c[cellid[i][0]].h
+            w_ghost[i].Z = w_c[cellid[i][0]].Z
+            w_ghost[i].hc = w_c[cellid[i][0]].hc
+        
+            w_ghost[i].hu = w_c[cellid[i][0]].h * u_g
+            w_ghost[i].hv = w_c[cellid[i][0]].h * v_g
+'''
+        
+
+###############mach number############
+@njit
+def MN(rho_c:'float[:]',rhou_c:'float[:]',rhov_c:'float[:]',P_c:'float[:]', gamma:'float'):
+    nb=len(rho_c)
+    MN=np.zeros(nb)
+    u_c=np.zeros(nb)
+    v_c=np.zeros(nb)
+
+    for i in range(nb):
+        u_c[i]=rhou_c[i]/rho_c[i]
+        v_c[i]=rhov_c[i]/rho_c[i]
+        c=np.sqrt(gamma*P_c[i]/rho_c[i])
+        MN[i]=np.sqrt(u_c[i]**2+v_c[i]**2)/c
+    return MN
+
+##################################"Double Mach Problem################################################"
+@njit
+def ghost_value_DoubleMach(rhog:'float[:]',Pg:'float[:]',rhoug:'float[:]',rhovg:'float[:]',
+                     rhoEg:'float[:]', rhoc:'float[:]',Pc:'float[:]',rhouc:'float[:]',rhovc:'float[:]',rhoEc:'float[:]',
+                     cellid:'int[:,:]', normal:'float[:,:]',mesure:'float[:]',center:'float[:,:]', t: 'float',faces_in:'float[:]',faces_out:'float[:]',faces_upper:'float[:]',faces_bottom:'float[:]'):
+   
+    s_n = np.zeros(2)
+    for i in faces_in:
+                                
+        ### Neumann
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] = rhouc[cellid[i][0]]
+        rhovg[i] = rhovc[cellid[i][0]]
+        rhoEg[i] = rhoEc[cellid[i][0]]
+        Pg[i]    = Pc[cellid[i][0]]
+       # ug[i] = rhoug[i]/rhog[i]
+        #vg[i] = rhovg[i]/rhog[i]
+        
+    for i in faces_out:
+        ### Neumann
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] = rhouc[cellid[i][0]]
+        rhovg[i] = rhovc[cellid[i][0]]
+        rhoEg[i] = rhoEc[cellid[i][0]]
+        Pg[i]    = Pc[cellid[i][0]]
+        #ug[i] = rhoug[i]/rhog[i]
+       # vg[i] = rhovg[i]/rhog[i]    
+   
+    for i in faces_bottom :
+        #### Double Mach
+        xs = center[i][0]
+        if xs > 1/6:
+                            
+            u_i = rhouc[cellid[i][0]]/rhoc[cellid[i][0]]
+            v_i = rhovc[cellid[i][0]]/rhoc[cellid[i][0]]
+    
+            s_n[:] =  normal[i][0:2]
+            s_n[0]=s_n[0]/mesure[i]
+            s_n[1]=s_n[1]/mesure[i]
+            u_g = u_i-2*(u_i*s_n[0]+v_i*s_n[1])*s_n[0]
+            v_g = v_i-2*(u_i*s_n[0]+v_i*s_n[1])*s_n[1]
+            
+            #u_g = u_i*(s_n[1]*s_n[1] - s_n[0]*s_n[0]) - 2.0*v_i*s_n[0]*s_n[1]
+            #v_g = v_i*(s_n[0]*s_n[0] - s_n[1]*s_n[1]) - 2.0*u_i*s_n[0]*s_n[1]
+                        
+            rhog[i]  = rhoc[cellid[i][0]]
+            rhoug[i] = rhoc[cellid[i][0]] * u_g
+            rhovg[i] = rhoc[cellid[i][0]] * v_g
+            rhoEg[i] = rhoEc[cellid[i][0]]
+            Pg[i] = Pc[cellid[i][0]]
+            #ug[i] = rhoug[i]/rhog[i]
+            #vg[i] = rhovg[i]/rhog[i]
+            
+        else:
+            
+            rhog[i]  = 8
+            rhoug[i] = 8.25*8*np.cos(np.pi/6)
+            rhovg[i] = -8.25*8*np.sin(np.pi/6)
+            Pg[i]    = 116.5
+            rhoEg[i]  = 0.5*(rhoug[i]**2 + rhovg[i]**2)/rhog[i] + Pg[i]/(1.4-1)            
+            #ug[i]    = rhoug[i]/rhog[i]
+            #vg[i]    = rhovg[i]/rhog[i]
+    for i in faces_upper:   
+        ## Double Mach
+        xcent = center[i][0]
+        if xcent < 1/6 +(1+20*t)/np.sqrt(3):
+            rhog[i]   = 8.0
+            rhoug[i]  = 8.25*8*np.cos(np.pi/6)
+            rhovg[i]  =-8.25*8*np.sin(np.pi/6)
+            Pg[i]     = 116.5
+        else:
+            rhog[i]   = 1.4
+            Pg[i]     = 1
+            rhoug[i]  = 0.0
+            rhovg[i]  = 0.0
+        rhoEg[i]  = 0.5*(rhoug[i]**2 + rhovg[i]**2)/rhog[i] + Pg[i]/(1.4-1)            
+       # ug[i]    = rhoug[i]/rhog[i]
+      #  vg[i]    = rhovg[i]/rhog[i] 
+
+
+
+@njit
+def haloghost_value_DoubleMach(rho_halo:'float[:]',rhou_halo:'float[:]', rhov_halo:'float[:]', rhoE_halo:'float[:]', P_halo:'float[:]', 
+                            rho_haloghost:'float[:]', rhou_haloghost:'float[:]',rhov_haloghost:'float[:]',rhoE_haloghost:'float[:]',P_haloghost:'float[:]'
+                            ,haloghostcenter:'float[:,:,:]', halonodes:'float[:]', haloghostfaceinfo:'float[:,:,:]',center:'float[:,:]', t:'float'):
+    s_n = np.zeros(2)
+    for i in halonodes:
+        for j in range(len(haloghostcenter[i])):
+            if haloghostcenter[i][j][-1] != -1:
+                if haloghostcenter[i][j][-2] == 1:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+    
+                    rho_haloghost[cellghost]   = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = rhov_halo[cellhalo]
+                    rhoE_haloghost[cellghost]   = rhoE_halo[cellhalo]
+                    P_haloghost[cellghost]   = P_halo[cellhalo]
+
+                elif haloghostcenter[i][j][-2] == 2:
+
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                    
+                    rho_haloghost[cellghost]   = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = rhov_halo[cellhalo]
+                    rhoE_haloghost[cellghost]   = rhoE_halo[cellhalo]
+                    P_haloghost[cellghost]   = P_halo[cellhalo]
+                
+                elif haloghostcenter[i][j][-2] == 3:
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    xs = center[cellghost][0]
+                    if xs > 1/6:
+                        #print(rho_halo[cellghost])
+                        u_i = rhou_halo[cellghost]/rho_halo[cellghost]
+                        v_i = rhou_halo[cellghost]/rho_halo[cellghost]
+                        mesure = np.sqrt(haloghostfaceinfo[i][j][2]**2 + haloghostfaceinfo[i][j][3]**2) 
+        
+                        s_n[0] = haloghostfaceinfo[i][j][2] / mesure
+                        s_n[1] = haloghostfaceinfo[i][j][3] / mesure
+                        
+                        u_g = u_i*(s_n[1]*s_n[1] - s_n[0]*s_n[0]) - 2.0*v_i*s_n[0]*s_n[1]
+                        v_g = v_i*(s_n[1]*s_n[1] - s_n[0]*s_n[0]) - 2.0*v_i*s_n[0]*s_n[1]
+                        rho_haloghost[cellghost]   = rho_halo[cellhalo]
+                        P_haloghost[cellghost]   = P_halo[cellhalo]
+                        rhou_haloghost[cellghost] = rho_haloghost[cellghost]* u_g
+                        rhov_haloghost[cellghost] = rho_haloghost[cellghost]* v_g
+                    else:
+                             
+                        rho_haloghost[cellghost]   = 8.0
+                        rhou_haloghost[cellghost]  = 8.25*8*np.cos(np.pi/6)
+                        rhov_haloghost[cellghost]  =-8.25*8*np.sin(np.pi/6)
+                        P_haloghost[cellghost]     = 116.5
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)              
+               
+                elif haloghostcenter[i][j][-2] == 4:
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    ## Double Mach
+                    xcent = center[cellghost][0]
+                    
+                    if xcent < 1/6 +(1+20*t)/np.sqrt(3):
+                        
+                        rho_haloghost[cellghost]   = 8.0
+                        rhou_haloghost[cellghost]  = 8.25*8*np.cos(np.pi/6)
+                        rhov_haloghost[cellghost]  =-8.25*8*np.sin(np.pi/6)
+                        P_haloghost[cellghost]     = 116.5
+                        rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                        
+                    else:
+                        rho_haloghost[cellghost]   = 1.4
+                        P_haloghost[cellghost]     = 1
+                        rhou_haloghost[cellghost]  = 0.0
+                        rhov_haloghost[cellghost]  = 0.0
+                        rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)            
+                    # ug[i]    = rhoug[i]/rhog[i]
+                    #  vg[i]    = rhovg[i]/rhog[i] 
+
+################################GAMM CHANNAL####################################
+
+@njit
+def ghost_value_gamm(rhog:'float[:]',Pg:'float[:]',rhoug:'float[:]',rhovg:'float[:]',rhoEg:'float[:]', rhoc:'float[:]',Pc:'float[:]',rhouc:'float[:]',rhovc:'float[:]',rhoEc:'float[:]', cellid:'int[:,:]', normal:'float[:,:]',mesure:'float[:]',faces_in:'float[:]',faces_out:'float[:]',faces_upper:'float[:]',faces_bottom:'float[:]'):
+   
+    s_n=np.zeros(2)
+
+    for i in faces_in:
+        kappa=1.4
+        p0=101391.8555
+        rho0=1.1845
+        p=min(p0,Pc[cellid[i][0]])
+        M2=(pow(p / p0, -(kappa - 1.0) / kappa) - 1.0) * 2.0 / (kappa - 1.0)
+        tmp = 1.0 + (kappa - 1.0) * 0.5 * M2
+        rho = rho0 * pow(tmp, -1.0 /(kappa - 1.0))
+        a2 = kappa * p / rho
+        rhoVel = rho*np.sqrt(M2 * a2)
+        
+        rhoe = p / (kappa - 1.) + 0.5 * (pow(rhoVel, 2))
+        
+        rhog[i] = rho
+        Pg[i] = p
+        rhoEg[i] = rhoe
+        rhoug[i] = rhoVel
+        rhovg[i] = 0.
+        
+    
+    for i in faces_out:
+            kappa=1.4
+            MaIs=0.675
+            p0=101391.8555
+            p = p0*pow(1. + (kappa - 1.) / 2. * MaIs*MaIs, kappa / (1. - kappa))
+            
+
+            
+            he = p / (kappa - 1.) + 0.5 * (pow(rhouc[cellid[i][0]],2) + pow(rhovc[cellid[i][0]],2))
+            rhog[i] = rhoc[cellid[i][0]]            
+            rhoug[i] = rhouc[cellid[i][0]]
+            rhovg[i] = rhovc[cellid[i][0]]
+            rhoEg[i] = he
+            Pg[i] = p
+            
+        
+    for  i in faces_upper :
+
+        u_i = rhouc[cellid[i][0]]/rhoc[cellid[i][0]]
+        v_i = rhovc[cellid[i][0]]/rhoc[cellid[i][0]]
+
+        
+        s_n[:] =  normal[i][0:2]
+        s_n[0]=s_n[0]/mesure[i]
+        s_n[1]=s_n[1]/mesure[i]
+        u_g = u_i-2*(u_i*s_n[0]+v_i*s_n[1])*s_n[0]
+        v_g = v_i-2*(u_i*s_n[0]+v_i*s_n[1])*s_n[1]
+        
+        # u_g = u_i*(s_n[1]*s_n[1] - s_n[0]*s_n[0]) - 2.0*v_i*s_n[0]*s_n[1]
+        # v_g = v_i*(s_n[0]*s_n[0] - s_n[1]*s_n[1]) - 2.0*u_i*s_n[0]*s_n[1]
+        
+        rhog[i] = rhoc[cellid[i][0]]
+        rhoug[i] = rhoc[cellid[i][0]] * u_g
+        rhovg[i] = rhoc[cellid[i][0]] * v_g
+        rhoEg[i] = rhoEc[cellid[i][0]]
+        Pg[i] = Pc[cellid[i][0]]
+    for i in faces_bottom:
+    
+        u_i = rhouc[cellid[i][0]]/rhoc[cellid[i][0]]
+        v_i = rhovc[cellid[i][0]]/rhoc[cellid[i][0]]
+
+        
+        s_n[:] =  normal[i][0:2]
+        s_n[0]=s_n[0]/mesure[i]
+        s_n[1]=s_n[1]/mesure[i]
+        u_g = u_i-2*(u_i*s_n[0]+v_i*s_n[1])*s_n[0]
+        v_g = v_i-2*(u_i*s_n[0]+v_i*s_n[1])*s_n[1]
+        
+        # u_g = u_i*(s_n[1]*s_n[1] - s_n[0]*s_n[0]) - 2.0*v_i*s_n[0]*s_n[1]
+        # v_g = v_i*(s_n[0]*s_n[0] - s_n[1]*s_n[1]) - 2.0*u_i*s_n[0]*s_n[1]
+        
+        rhog[i] = rhoc[cellid[i][0]]
+        rhoug[i] = rhoc[cellid[i][0]] * u_g
+        rhovg[i] = rhoc[cellid[i][0]] * v_g
+        rhoEg[i] = rhoEc[cellid[i][0]]
+        Pg[i] = Pc[cellid[i][0]]
+
+
+
+
+@njit
+def haloghost_value_Gamm2d(rho_halo:'float[:]',rhou_halo:'float[:]', rhov_halo:'float[:]', rhoE_halo:'float[:]', P_halo:'float[:]', 
+                            rho_haloghost:'float[:]', rhou_haloghost:'float[:]',rhov_haloghost:'float[:]',rhoE_haloghost:'float[:]',P_haloghost:'float[:]'
+                            ,haloghostcenter:'float[:,:,:]', halonodes:'float[:]', haloghostfaceinfo:'float[:,:,:]'):
+    s_n = np.zeros(2)
+    for i in halonodes:
+        for j in range(len(haloghostcenter[i])):
+            if haloghostcenter[i][j][-1] != -1:
+                if haloghostcenter[i][j][-2] == 1:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                    kappa=1.4
+                    p0=101391.8555
+                    rho0=1.1845
+                    p=min(p0,P_halo[cellhalo])
+                    M2=(pow(p / p0, -(kappa - 1.0) / kappa) - 1.0) * 2.0 / (kappa - 1.0)
+                    tmp = 1.0 + (kappa - 1.0) * 0.5 * M2
+                    rho = rho0 * pow(tmp, -1.0 /(kappa - 1.0))
+                    a2 = kappa * p / rho
+                    rhoVel = rho*np.sqrt(M2 * a2)
+                    
+                    rhoe = p / (kappa - 1.) + 0.5 * (pow(rhoVel, 2))
+                    
+                
+        
+                    rho_haloghost[cellghost]   = rho
+                    rhou_haloghost[cellghost]   = rhoVel
+                    rhov_haloghost[cellghost]   = 0
+                    rhoE_haloghost[cellghost]   = rhoe
+                    P_haloghost[cellghost]   = p
+
+                elif haloghostcenter[i][j][-2] == 2:
+
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                    kappa=1.4
+                    MaIs=0.675
+                    p0=101391.8555
+                    p = p0*pow(1. + (kappa - 1.) / 2. * MaIs*MaIs, kappa / (1. - kappa))
+            
+                    he = p / (kappa - 1.) + 0.5 * (pow(rhou_halo[cellhalo],2) + pow(rhov_halo[cellhalo],2))
+                    
+                    rho_haloghost[cellghost]   = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = rhov_halo[cellhalo]
+                    rhoE_haloghost[cellghost]   = he
+                    P_haloghost[cellghost]   = p
+                
+                elif haloghostcenter[i][j][-2] == 3:
+                                       
+                        cellghost = np.int32(haloghostcenter[i][j][-1])
+                        cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                        u_i = rhou_halo[cellghost]/rho_halo[cellghost]
+                        v_i = rhou_halo[cellghost]/rho_halo[cellghost]
+                        mesure = np.sqrt(haloghostfaceinfo[i][j][2]**2 + haloghostfaceinfo[i][j][3]**2) 
+        
+                        s_n[0] = haloghostfaceinfo[i][j][2] / mesure
+                        s_n[1] = haloghostfaceinfo[i][j][3] / mesure
+                        
+                        u_g = u_i*(s_n[1]*s_n[1] - s_n[0]*s_n[0]) - 2.0*v_i*s_n[0]*s_n[1]
+                        v_g = v_i*(s_n[1]*s_n[1] - s_n[0]*s_n[0]) - 2.0*v_i*s_n[0]*s_n[1]
+                        rho_haloghost[cellghost]   = rho_halo[cellhalo]
+                        P_haloghost[cellghost]   = P_halo[cellhalo]
+                        rhoE_haloghost[cellghost]   = rhoE_halo[cellhalo]
+                        rhou_haloghost[cellghost] = rho_haloghost[cellghost]* u_g
+                        rhov_haloghost[cellghost] = rho_haloghost[cellghost]* v_g
+                  
+             
+                elif haloghostcenter[i][j][-2] == 4:
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    u_i = rhou_halo[cellghost]/rho_halo[cellghost]
+                    v_i = rhou_halo[cellghost]/rho_halo[cellghost]
+                    mesure = np.sqrt(haloghostfaceinfo[i][j][2]**2 + haloghostfaceinfo[i][j][3]**2) 
+    
+                    s_n[0] = haloghostfaceinfo[i][j][2] / mesure
+                    s_n[1] = haloghostfaceinfo[i][j][3] / mesure
+                    
+                    u_g = u_i*(s_n[1]*s_n[1] - s_n[0]*s_n[0]) - 2.0*v_i*s_n[0]*s_n[1]
+                    v_g = v_i*(s_n[1]*s_n[1] - s_n[0]*s_n[0]) - 2.0*v_i*s_n[0]*s_n[1]
+                    rho_haloghost[cellghost]   = rho_halo[cellhalo]
+                    P_haloghost[cellghost]   = P_halo[cellhalo]
+                    rhoE_haloghost[cellghost]   = rhoE_halo[cellhalo]
+                    rhou_haloghost[cellghost] = rho_haloghost[cellghost]* u_g
+                    rhov_haloghost[cellghost] = rho_haloghost[cellghost]* v_g
+                
+             
+
+    ################################test1###########################################
+
+#@njit
+def ghost_value_test(rhog:'float[:]',Pg:'float[:]',rhoug:'float[:]',rhovg:'float[:]',
+                     rhoEg:'float[:]', rhoc:'float[:]',Pc:'float[:]',rhouc:'float[:]',rhovc:'float[:]',rhoEc:'float[:]',
+                     cellid:'int32[:,:]', normal:'float[:,:]',mesure:'float[:]',faces_in:'float[:]'
+                      ,faces_out:'float[:]',faces_upper:'float[:]',faces_bottom:'float[:]', rl:'float', rr:'float', pl:'float', pr:'float'):
+   
+    s_n = np.zeros(2)
+    for i in faces_in:
+                                
+        ### Neumann
+        
+        rhog[i]  = rl
+        rhoug[i] = rhouc[cellid[i][0]]
+        rhovg[i] = rhovc[cellid[i][0]]
+        Pg[i]    = pl
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+       
+    for i in faces_out:
+        
+        ### Neumann
+        rhog[i]  = rr
+        rhoug[i] = rhouc[cellid[i][0]]
+        rhovg[i] = rhovc[cellid[i][0]]
+        Pg[i]    = pr
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+      
+    for i in faces_upper :
+               
+        u_i = rhouc[cellid[i][0]]/rhoc[cellid[i][0]]
+        v_i = rhovc[cellid[i][0]]/rhoc[cellid[i][0]]
+
+        s_n[:] =  normal[i][0:2]
+        s_n[0]=s_n[0]/mesure[i]
+        s_n[1]=s_n[1]/mesure[i]
+    
+        u_g = u_i*(s_n[1]*s_n[1] - s_n[0]*s_n[0]) - 2.0*v_i*s_n[0]*s_n[1]
+        v_g = v_i*(s_n[0]*s_n[0] - s_n[1]*s_n[1]) - 2.0*u_i*s_n[0]*s_n[1]
+        #u_g = u_i-2*(u_i*s_n[0]+v_i*s_n[1])*s_n[0]
+        #v_g = v_i-2*(u_i*s_n[0]+v_i*s_n[1])*s_n[1]
+                
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] = rhoc[cellid[i][0]] * u_g
+        rhovg[i] = rhoc[cellid[i][0]] * v_g
+        Pg[i] = Pc[cellid[i][0]]
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+        
+    for i in faces_bottom:
+        
+        u_i = rhouc[cellid[i][0]]/rhoc[cellid[i][0]]
+        v_i = rhovc[cellid[i][0]]/rhoc[cellid[i][0]]
+
+        s_n[:] =  normal[i][0:2]
+        s_n[0]=s_n[0]/mesure[i]
+        s_n[1]=s_n[1]/mesure[i]
+        
+        u_g = u_i*(s_n[1]*s_n[1] - s_n[0]*s_n[0]) - 2.0*v_i*s_n[0]*s_n[1]
+        v_g = v_i*(s_n[0]*s_n[0] - s_n[1]*s_n[1]) - 2.0*u_i*s_n[0]*s_n[1]
+        #u_g = u_i-2*(u_i*s_n[0]+v_i*s_n[1])*s_n[0]
+        #v_g = v_i-2*(u_i*s_n[0]+v_i*s_n[1])*s_n[1]
+        
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] = rhoc[cellid[i][0]] * u_g
+        rhovg[i] = rhoc[cellid[i][0]] * v_g
+        Pg[i] = Pc[cellid[i][0]]
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+
+#@njit
+def haloghost_value_test(rho_halo:'float[:]',rhou_halo:'float[:]', rhov_halo:'float[:]', rhoE_halo:'float[:]', P_halo:'float[:]', 
+                            rho_haloghost:'float[:]', rhou_haloghost:'float[:]',rhov_haloghost:'float[:]',rhoE_haloghost:'float[:]',P_haloghost:'float[:]'
+                            ,haloghostcenter:'float[:,:,:]', halonodes:'float[:]', haloghostfaceinfo:'float[:,:,:]',center:'float[:,:]', t:'float',
+                            rl:'float', rr:'float', pl:'float', pr:'float'):
+    s_n = np.zeros(2)
+    for i in halonodes:
+        for j in range(len(haloghostcenter[i])):
+            if haloghostcenter[i][j][-1] != -1:
+                if haloghostcenter[i][j][-2] == 1:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+
+                    rho_haloghost[cellghost]    = rl
+                    rhou_haloghost[cellghost]   = rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = rhov_halo[cellhalo]
+                    P_haloghost[cellghost]      = pl
+                    rhoE_haloghost[cellghost]   = pl/(1.4-1) +0.5*(rhou_haloghost[cellghost]**2+rhov_haloghost[cellghost] **2)/(rho_haloghost[cellghost])
+
+                elif haloghostcenter[i][j][-2] == 2:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+    
+                    rho_haloghost[cellghost]    = rr
+                    rhou_haloghost[cellghost]   = rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = rhov_halo[cellhalo]
+                    P_haloghost[cellghost]      = pr
+                    rhoE_haloghost[cellghost]   = pr/(1.4-1) +0.5*(rhou_haloghost[cellghost]**2+rhov_haloghost[cellghost] **2)/(rho_haloghost[cellghost])
+
+                elif haloghostcenter[i][j][-2] == 3:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = int(haloghostcenter[i][j][-1])
+
+                    u_i = rhou_halo[cellghost]/rho_halo[cellghost]
+                    v_i = rhou_halo[cellghost]/rho_halo[cellghost]
+                    
+                    mesure = np.sqrt(haloghostfaceinfo[i][j][2]**2 + haloghostfaceinfo[i][j][3]**2) # + haloghostfaceinfo[i][5]**2)
+    
+                    s_n[0] = haloghostfaceinfo[i][j][2] / mesure
+                    s_n[1] = haloghostfaceinfo[i][j][3] / mesure
+                    
+                    u_g = u_i*(s_n[1]*s_n[1] - s_n[0]*s_n[0]) - 2.0*v_i*s_n[0]*s_n[1]
+                    v_g = v_i*(s_n[1]*s_n[1] - s_n[0]*s_n[0]) - 2.0*v_i*s_n[0]*s_n[1]
+
+                    rhou_haloghost[cellghost] = rho_haloghost[cellghost]* u_g
+                    rhov_haloghost[cellghost] = rho_haloghost[cellghost]* v_g
+
+                    rho_haloghost[cellghost]   = rho_halo[cellhalo]
+                    P_haloghost[cellghost]   = P_halo[cellhalo]
+                    rhoE_haloghost[cellghost]   = P_haloghost[cellghost]/(1.4-1) +0.5*(rhou_haloghost[cellghost]**2+rhov_haloghost[cellghost] **2)/(rho_haloghost[cellghost])
+                    
+                elif haloghostcenter[i][j][-2] == 4:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = int(haloghostcenter[i][j][-1])
+
+                    u_i = rhou_halo[cellghost]/rho_halo[cellghost]
+                    v_i = rhou_halo[cellghost]/rho_halo[cellghost]
+                   
+                    
+                    mesure = np.sqrt(haloghostfaceinfo[i][j][2]**2 + haloghostfaceinfo[i][j][3]**2) # + haloghostfaceinfo[i][5]**2)
+                    
+                    
+                    s_n[0] = haloghostfaceinfo[i][j][2] / mesure
+                    s_n[1] = haloghostfaceinfo[i][j][3] / mesure
+                    
+                    u_g = u_i*(s_n[1]*s_n[1] - s_n[0]*s_n[0]) - 2.0*v_i*s_n[0]*s_n[1]
+                    v_g = v_i*(s_n[1]*s_n[1] - s_n[0]*s_n[0]) - 2.0*v_i*s_n[0]*s_n[1]
+
+                    rhou_haloghost[cellghost] = rho_haloghost[cellghost]* u_g
+                    rhov_haloghost[cellghost] = rho_haloghost[cellghost]* v_g
+
+                    rho_haloghost[cellghost]   = rho_halo[cellhalo]
+                    P_haloghost[cellghost]   = P_halo[cellhalo]
+                    rhoE_haloghost[cellghost]   = P_haloghost[cellghost]/(1.4-1) +0.5*(rhou_haloghost[cellghost]**2+rhov_haloghost[cellghost] **2)/(rho_haloghost[cellghost])
+
+@njit
+def ghost_value_RS(rhog:'float[:]',Pg:'float[:]',rhoug:'float[:]',rhovg:'float[:]',
+                     rhoEg:'float[:]', rhoc:'float[:]',Pc:'float[:]',rhouc:'float[:]',rhovc:'float[:]',rhoEc:'float[:]',
+                     cellid:'int[:,:]',faces_in:'float[:]'
+                      ,faces_out:'float[:]',faces_upper:'float[:]',faces_bottom:'float[:]'):
+   
+    s_n = np.zeros(2)
+    for i in faces_in:
+                                
+        ### Neumann
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] = rhouc[cellid[i][0]]
+        rhovg[i] = rhovc[cellid[i][0]]
+        Pg[i]    = Pc[cellid[i][0]]
+        rhoEg[i]=rhoEc[cellid[i][0]]
+       
+    for i in faces_out:
+        
+        ### Neumann
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] = rhouc[cellid[i][0]]
+        rhovg[i] = rhovc[cellid[i][0]]
+        Pg[i]    = Pc[cellid[i][0]]
+        rhoEg[i]=rhoEc[cellid[i][0]]
+       
+      
+    for i in faces_upper :
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] = rhouc[cellid[i][0]]
+        rhovg[i] = rhovc[cellid[i][0]]
+        Pg[i]    = Pc[cellid[i][0]]
+        rhoEg[i]=rhoEc[cellid[i][0]]
+       
+
+    for i in faces_bottom:
+        
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] = rhouc[cellid[i][0]]
+        rhovg[i] = rhovc[cellid[i][0]]
+        Pg[i]    = Pc[cellid[i][0]]
+        rhoEg[i]=rhoEc[cellid[i][0]]
+
+@njit
+def haloghost_value_RS(rho_halo:'float[:]',rhou_halo:'float[:]', rhov_halo:'float[:]', rhoE_halo:'float[:]', P_halo:'float[:]', 
+                            rho_haloghost:'float[:]', rhou_haloghost:'float[:]',rhov_haloghost:'float[:]',rhoE_haloghost:'float[:]',P_haloghost:'float[:]'
+                            ,haloghostcenter:'float[:,:,:]', halonodes:'float[:]', haloghostfaceinfo:'float[:,:,:]',center:'float[:,:]', t:'float'):
+    s_n = np.zeros(2)
+    for i in halonodes:
+        for j in range(len(haloghostcenter[i])):
+            if haloghostcenter[i][j][-1] != -1:
+                if haloghostcenter[i][j][-2] == 1:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = rhov_halo[cellhalo]
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    rhoE_haloghost[cellghost]   = rhoE_halo[cellhalo]
+                elif haloghostcenter[i][j][-2] == 2:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+    
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = rhov_halo[cellhalo]
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    rhoE_haloghost[cellghost]   = rhoE_halo[cellhalo]
+                elif haloghostcenter[i][j][-2] == 3:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = int(haloghostcenter[i][j][-1])
+                    
+                    rho_haloghost[cellghost]   = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost] = rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost] = rhov_halo[cellhalo]
+
+                    P_haloghost[cellghost]   = P_halo[cellhalo]
+                    rhoE_haloghost[cellghost]   = rhoE_halo[cellhalo]
+
+                elif haloghostcenter[i][j][-2] == 4:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = int(haloghostcenter[i][j][-1])
+
+                    
+                    rho_haloghost[cellghost]   = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost] =  rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost] = rhov_halo[cellhalo]
+
+                
+                    P_haloghost[cellghost]   = P_halo[cellhalo]
+                    rhoE_haloghost[cellghost]   =  rhoE_halo[cellhalo]
+@njit
+def residual(W_1:'float[:]',W_2:'float[:]', t:'float'):
+    N=len(W_2)
+    S=0
+    # seul=0
+    # retu=np.zeros(2)
+    for i in range(N):
+
+        S+= ((W_2[i]-W_1[i])/t)**2
+        # seul+=(W_2[i]-W_1[i])**2
+
+    Error=1/N*np.sqrt(S)
+    # seul=np.sqrt(seul)
+    # retu[0]=seul
+    # retu[1]=Error
+
+    return Error
+
+
+
+@njit
+def norml2(appr:'float[:]', exact:'float[:]', volume:'float[:]'):
+
+    nbcells = len(exact)
+    # print("number of the volumes is:",len(volume))
+
+    Error = np.zeros(nbcells)
+    Ex = np.zeros(nbcells)
+
+    for i in range(len(exact)):
+        Error[i] = np.fabs(appr[i] - exact[i]) * volume[i]
+        Ex[i] = np.fabs(exact[i]) *volume[i]
+    # ErrorL = np.linalg.norm(Error,ord=1)/np.linalg.norm(Ex,ord=1)
+    num = np.sum(Error)
+    den = np.sum(Ex)
+    ErrorL = num / den
+
+    return ErrorL
+@njit
+def norm_L2(appr:'float[:]', exact:'float[:]', volume:'float[:]'):
+
+    nbcells = len(exact)
+    # print("number of the volumes is:",len(volume))
+    S=0
+    for i in range(len(exact)):
+        S+= ((appr[i] - exact[i])**2)* volume[i]
+ 
+    ErrorL = np.sqrt(S)
+    return ErrorL
+
+
+
+@njit
+def initialisation_poiseuille1(rho:'float[:]', rhou:'float[:]', rhov:'float[:]', rhoE:'float[:]',e_internal:'float[:]', P:'float[:]', center:'float[:,:]', gamma='float'):
+    
+    nbelements = len(rho)
+    for i in range(nbelements):
+        x= center[i][0]
+        # p0=1
+        # dpdx=-8
+        rho[i]=1
+        rhou[i]=0.0
+        rhov[i]=0.0
+        # P[i]=-8*(x-1)
+        P[i]=1
+        
+        rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+        e_internal[i]=P[i]/((gamma-1)*rho[i] )
+
+
+@njit
+def haloghost_value_poiseuille1(rho_halo:'float[:]',rhou_halo:'float[:]', rhov_halo:'float[:]', rhoE_halo:'float[:]', P_halo:'float[:]', 
+                            rho_haloghost:'float[:]', rhou_haloghost:'float[:]',rhov_haloghost:'float[:]',rhoE_haloghost:'float[:]',P_haloghost:'float[:]'
+                            ,haloghostcenter:'float[:,:,:]', halonodes:'float[:]', center:'float[:,:]'):
+                           
+    s_n = np.zeros(2)
+    for i in halonodes:
+        for j in range(len(haloghostcenter[i])):
+            if haloghostcenter[i][j][-1] != -1:
+                if haloghostcenter[i][j][-2] == 1:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+
+                    ys = center[cellghost][1]
+
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   =  4*ys*(1-ys)*rho_haloghost[cellghost]  
+                    rhov_haloghost[cellghost]   = 0
+                    P_haloghost[cellghost]      = 8
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                        
+                elif haloghostcenter[i][j][-2] == 2:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+    
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = rhov_halo[cellhalo]
+                    P_haloghost[cellghost]      = 0
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                        
+                elif haloghostcenter[i][j][-2] == 3:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = int(haloghostcenter[i][j][-1])
+
+                    
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = -1*rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                        
+
+                elif haloghostcenter[i][j][-2] == 4:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = int(haloghostcenter[i][j][-1])
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = -1*rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                        
+@njit
+def ghost_value_poiseuille1(rhog:'float[:]',Pg:'float[:]',rhoug:'float[:]',rhovg:'float[:]',
+                     rhoEg:'float[:]', rhoc:'float[:]',Pc:'float[:]',rhouc:'float[:]',rhovc:'float[:]',rhoEc:'float[:]',
+                     cellid:'int32[:,:]', normal:'float[:,:]',mesure:'float[:]',faces_in:'float[:]'
+                      ,faces_out:'float[:]',faces_upper:'float[:]',faces_bottom:'float[:]',center:'float[:,:]', H:'float',U_max:'float'):
+    
+    for i in faces_in:
+        y=center[i][1]
+        # x=center[i][0]
+                                
+        ### Neumann
+        
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] = 4*y*(1-y)*rhog[i]
+        rhovg[i] = 0
+        # rhog[i]  = rhoc[cellid[i][0]]
+        # rhoug[i] = rhouc[cellid[i][0]]
+        # rhovg[i] = rhovc[cellid[i][0]]
+        # Pg[i]    = Pc[cellid[i][0]] 
+        Pg[i]= 8
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+       
+    for i in faces_out:
+        
+        # ### Neumann
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] = rhouc[cellid[i][0]]
+        rhovg[i] = rhovc[cellid[i][0]]
+        Pg[i]    =0
+        # Pg[i]    =Pc[cellid[i][0]]
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+      
+    for i in faces_upper :
+    
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] = -1*rhouc[cellid[i][0]]
+        rhovg[i] = -1*rhovc[cellid[i][0]] 
+        # rhoug[i] = 0
+        # rhovg[i] = 0
+        Pg[i] = Pc[cellid[i][0]]
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+     
+
+    for i in faces_bottom:
+        
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] = -1*rhouc[cellid[i][0]] 
+        rhovg[i] = -1*rhovc[cellid[i][0]] 
+        # rhoug[i] =0
+        # rhovg[i] = 0
+        Pg[i] = Pc[cellid[i][0]]
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+      
+
+@njit
+def exact_poiseuille(center:'float[:,:]', u_exact:'float[:]',p_exact:'float[:]', H:'float', mu:'float', GP:'float'):
+    nbelement=len(center)
+    for i in range(nbelement):
+        y=center[i][1]
+        x=center[i][0]
+        u_exact[i]=GP/(2*mu)*y*(H-y)
+        p_exact[i]=-8*(x-1)
+
+
+@njit
+def poiseuille_error(W_1:'float[:]', W_2:'float[:]',u_max:'float' ):
+
+    N=len(W_1)
+    S=0
+    relative=0
+    # seul=0
+    # retu=np.zeros(2)
+    for i in range(N):
+
+        S+= ((W_2[i]-W_1[i]))**2
+        relative+=W_1[i]**2
+        # seul+=(W_2[i]-W_1[i])**2
+
+    Error=np.sqrt(S)/np.sqrt(relative)
+    return Error
+
+
+@njit
+def initialisation_poiseuille(rho:'float[:]', rhou:'float[:]', rhov:'float[:]', rhoE:'float[:]',e_internal:'float[:]', P:'float[:]', center:'float[:,:]', gamma:'float',V_in:'float', P_in:'float', rho_in:'float'):
+    nbelements = len(rho)
+    for i in range(nbelements):
+        x= center[i][0]
+        rho[i]=rho_in
+        rhou[i]=0.0
+        rhov[i]=0.0
+        P[i]=P_in
+        if rho[i]!=0:
+            rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+            e_internal[i]=P[i]/((gamma-1)*rho[i] )
+        else:
+            rhoE[i]=0
+            e_internal[i]=0
+
+
+@njit
+def haloghost_value_poiseuille(rho_halo:'float[:]',rhou_halo:'float[:]', rhov_halo:'float[:]', rhoE_halo:'float[:]', P_halo:'float[:]', 
+                            rho_haloghost:'float[:]', rhou_haloghost:'float[:]',rhov_haloghost:'float[:]',rhoE_haloghost:'float[:]',P_haloghost:'float[:]'
+                            ,haloghostcenter:'float[:,:,:]', halonodes:'float[:]', center:'float[:,:]', V_in:'float', P_in:'float', rho_in:'float', mu:'float'):
+                           
+    s_n = np.zeros(2)
+    for i in halonodes:
+        for j in range(len(haloghostcenter[i])):
+            if haloghostcenter[i][j][-1] != -1:
+                if haloghostcenter[i][j][-2] == 1:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+
+                    ys = center[cellghost][1]
+
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   =  4*ys*(1-ys)*rho_haloghost[cellghost] 
+                    # rhou_haloghost[cellghost]   =  V_in*rho_in
+                    rhov_haloghost[cellghost]   = 0
+                    # P_haloghost[cellghost]      =P_in
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                        
+                elif haloghostcenter[i][j][-2] == 2:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                    ys = center[cellghost][1]
+    
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   =rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = 0
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                        
+                elif haloghostcenter[i][j][-2] == 3:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = int(haloghostcenter[i][j][-1])
+
+                    
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = -1*rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                        
+
+                elif haloghostcenter[i][j][-2] == 4:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = int(haloghostcenter[i][j][-1])
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = -1*rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                        
+@njit
+def ghost_value_poiseuille(rhog:'float[:]',Pg:'float[:]',rhoug:'float[:]',rhovg:'float[:]',
+                     rhoEg:'float[:]', rhoc:'float[:]',Pc:'float[:]',rhouc:'float[:]',rhovc:'float[:]',rhoEc:'float[:]',
+                     cellid:'int32[:,:]', normal:'float[:,:]',mesure:'float[:]',faces_in:'float[:]'
+                      ,faces_out:'float[:]',faces_upper:'float[:]',faces_bottom:'float[:]',center:'float[:,:]',  V_in:'float', P_in:'float', rho_in:'float', mu:'float'):
+    
+    for i in faces_in:
+        y=center[i][1]
+        # x=center[i][0]
+                                
+        ### Neumann
+        
+        rhog[i]  = rhoc[cellid[i][0]] 
+        rhoug[i] = 4*y*(1-y)* rhog[i]  
+        # rhoug[i] = V_in*rho_in
+        rhovg[i] = 0
+        # rhog[i]  = rhoc[cellid[i][0]]
+        # rhoug[i] = rhouc[cellid[i][0]]
+        # rhovg[i] = rhovc[cellid[i][0]]
+        Pg[i]    = Pc[cellid[i][0]]
+        # Pg[i]= 8
+        # Pg[i]=P_in
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+       
+    for i in faces_out:
+        y=center[i][1]
+        
+        # ### Neumann
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] =rhouc[cellid[i][0]]
+        rhovg[i] = 0
+        # Pg[i]    =0
+        Pg[i]    =Pc[cellid[i][0]]
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+      
+    for i in faces_upper :
+    
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] = -1*rhouc[cellid[i][0]]
+        rhovg[i] = -1*rhovc[cellid[i][0]] 
+        # rhoug[i] = 0
+        # rhovg[i] = 0
+        Pg[i] = Pc[cellid[i][0]]
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+     
+
+    for i in faces_bottom:
+        
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] = -1*rhouc[cellid[i][0]] 
+        rhovg[i] = -1*rhovc[cellid[i][0]] 
+        # rhoug[i] =0
+        # rhovg[i] = 0
+        Pg[i] = Pc[cellid[i][0]]
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+      
+
+
+                            
+
+
+@njit
+def initialisation_Cavity(rho:'float[:]', rhou:'float[:]', rhov:'float[:]', rhoE:'float[:]',e_internal:'float[:]', P:'float[:]', center:'float[:,:]', gamma:'float',V_in:'float', P_in:'float', rho_in:'float'):
+    
+     
+    nbelements = len(rho)
+    for i in range(nbelements):
+        x= center[i][0]
+        rho[i]=rho_in
+        rhou[i]=0.0
+        rhov[i]=0.0
+        P[i]=P_in
+        if rho[i]!=0:
+            rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+            e_internal[i]=P[i]/((gamma-1)*rho[i] )
+        else:
+            rhoE[i]=0
+            e_internal[i]=0
+
+
+@njit
+def haloghost_value_Cavity(rho_halo:'float[:]',rhou_halo:'float[:]', rhov_halo:'float[:]', rhoE_halo:'float[:]', P_halo:'float[:]', 
+                            rho_haloghost:'float[:]', rhou_haloghost:'float[:]',rhov_haloghost:'float[:]',rhoE_haloghost:'float[:]',P_haloghost:'float[:]'
+                            ,haloghostcenter:'float[:,:,:]', halonodes:'float[:]', center:'float[:,:]', V_in:'float', P_in:'float', rho_in:'float'):
+                           
+    s_n = np.zeros(2)
+    for i in halonodes:
+        for j in range(len(haloghostcenter[i])):
+            if haloghostcenter[i][j][-1] != -1:
+                if haloghostcenter[i][j][-2] == 1:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = -1*rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                      
+                elif haloghostcenter[i][j][-2] == 2:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+    
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = -1*rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                      
+                elif haloghostcenter[i][j][-2] == 3:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = int(haloghostcenter[i][j][-1])
+
+                    
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = 1*rho_haloghost[cellghost] 
+                    rhov_haloghost[cellghost]   = 0
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                        
+
+                elif haloghostcenter[i][j][-2] == 4:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = int(haloghostcenter[i][j][-1])
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = -1*rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                      
+@njit
+def ghost_value_Cavity(rhog:'float[:]',Pg:'float[:]',rhoug:'float[:]',rhovg:'float[:]',
+                     rhoEg:'float[:]', rhoc:'float[:]',Pc:'float[:]',rhouc:'float[:]',rhovc:'float[:]',rhoEc:'float[:]',
+                     cellid:'int32[:,:]', normal:'float[:,:]',mesure:'float[:]',faces_in:'float[:]'
+                      ,faces_out:'float[:]',faces_upper:'float[:]',faces_bottom:'float[:]',center:'float[:,:]',  V_in:'float', P_in:'float', rho_in:'float'):
+    for i in faces_in:
+       
+       
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] = -1*rhouc[cellid[i][0]] 
+        rhovg[i] = -1*rhovc[cellid[i][0]] 
+        # rhoug[i] =0
+        # rhovg[i] = 0
+        Pg[i] = Pc[cellid[i][0]]
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+      
+
+    for i in faces_out:
+        
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] = -1*rhouc[cellid[i][0]] 
+        rhovg[i] = -1*rhovc[cellid[i][0]] 
+        # rhoug[i] =0
+        # rhovg[i] = 0
+        Pg[i] = Pc[cellid[i][0]]
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+      
+
+    for i in faces_upper :
+    
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] = 1*rhog[i] 
+        rhovg[i] = 0
+        # rhoug[i] = 0
+        # rhovg[i] = 0
+        Pg[i] = Pc[cellid[i][0]]
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+     
+
+    for i in faces_bottom:
+        
+        rhog[i]  = rhoc[cellid[i][0]]
+        rhoug[i] = -1*rhouc[cellid[i][0]] 
+        rhovg[i] = -1*rhovc[cellid[i][0]] 
+        # rhoug[i] =0
+        # rhovg[i] = 0
+        Pg[i] = Pc[cellid[i][0]]
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+      
+
+
+#######Bougie
+@njit
+def initialisation_Bougie(rho:'float[:]', rhou:'float[:]', rhov:'float[:]', rhoE:'float[:]',e_internal:'float[:]', P:'float[:]',T:'float[:]',Y1:'float[:]',Y2:'float[:]',rhoY1:'float[:]',rhoY2:'float[:]', center:'float[:,:]', gamma:'float', R_gaz:'float'):
+   
+    nbelements = len(center)
+    
+    for i in range(nbelements):
+      #####oudit
+        rho[i]=1
+        rhou[i]=0
+        rhov[i]=0
+        T[i]=300
+        Y1[i]=0
+        Y2[i]=1
+        rhoY1[i]=0
+        rhoY2[i]=1
+        P[i]= rho[i]*T[i]*R_gaz
+        rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+        e_internal[i]=P[i]/((gamma-1)*rho[i] )
+         
+     
+@njit
+def ghost_value_Bougie(rhog:'float[:]',Pg:'float[:]',rhoug:'float[:]',rhovg:'float[:]',
+                     rhoEg:'float[:]',Tg:'float[:]',rhoY1g:'float[:]',rhoY2g:'float[:]',Y1g:'float[:]',Y2g:'float[:]',
+                    rhoc:'float[:]',Pc:'float[:]',rhouc:'float[:]',rhovc:'float[:]',Tc:'float[:]',rhoY1c:'float[:]',rhoY2c:'float[:]',Y1c:'float[:]',Y2c:'float[:]',
+                     cellid:'int[:,:]', center:'float[:,:]',faces_in:'float[:]',faces_out:'float[:]',faces_upper:'float[:]',faces_bottom:'float[:]',R_gaz:'int32',T_in:'float', U_in:'float'):
+    for i in faces_in:
+        y=center[i][1]
+        #####oudit(code)
+        if y>0.15 and y<0.35:
+            rhog[i]  = rhoc[cellid[i][0]] 
+            Y1g[i]    =1
+            Y2g[i]    = 0
+            rhoug[i] = U_in*rhoc[cellid[i][0]] 
+            rhovg[i] = 0
+            Tg[i]    = T_in      
+        else:
+            rhog[i]  = rhoc[cellid[i][0]] 
+            Y1g[i]    =0
+            Y2g[i]    = 1
+            rhoug[i] = U_in*rhoc[cellid[i][0]]
+            rhovg[i] = 0
+            Tg[i]    = 300
+
+        Pg[i]    = Tg[i]*R_gaz*rhog[i]  
+        rhoY1g[i]    = rhog[i] *Y1g[i] 
+        rhoY2g[i]    =  rhog[i] *Y2g[i] 
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+       
+
+    for i in faces_out:
+        #oudit(code)
+        rhog[i]  = rhoc[cellid[i][0]] 
+        Pg[i]    = Pc[cellid[i][0]]
+        Tg[i]    = Tc[cellid[i][0]]
+        rhoY1g[i]    = rhoY1c[cellid[i][0]]
+        rhoY2g[i]    = rhoY2c[cellid[i][0]]
+        Y1g[i]    = Y1c[cellid[i][0]]
+        Y2g[i]    = Y2c[cellid[i][0]]
+        rhoug[i] = rhouc[cellid[i][0]]
+        rhovg[i] = rhovc[cellid[i][0]] 
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+  
+    for i in faces_upper :
+    
+        rhog[i]  = rhoc[cellid[i][0]] 
+        Pg[i]    = Pc[cellid[i][0]]
+        Tg[i]    = Tc[cellid[i][0]]
+        rhoY1g[i]    = rhoY1c[cellid[i][0]]
+        rhoY2g[i]    = rhoY2c[cellid[i][0]]
+        Y1g[i]    = Y1c[cellid[i][0]]
+        Y2g[i]    = Y2c[cellid[i][0]]
+        rhoug[i] = -1*rhouc[cellid[i][0]]
+        rhovg[i] = -1*rhovc[cellid[i][0]] 
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+    
+    for i in faces_bottom:
+
+        rhog[i]  = rhoc[cellid[i][0]] 
+        Pg[i]    = Pc[cellid[i][0]]
+        Tg[i]    = Tc[cellid[i][0]]
+        rhoY1g[i]    = rhoY1c[cellid[i][0]]
+        rhoY2g[i]    = rhoY2c[cellid[i][0]]
+        Y1g[i]    = Y1c[cellid[i][0]]
+        Y2g[i]    = Y2c[cellid[i][0]]
+        rhoug[i] = -1*rhouc[cellid[i][0]]
+        rhovg[i] = -1*rhovc[cellid[i][0]] 
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+
+@njit
+def haloghost_value_Bougie(rho_halo:'float[:]',rhou_halo:'float[:]', rhov_halo:'float[:]', rhoE_halo:'float[:]', P_halo:'float[:]', 
+                           T_halo:'float[:]', rhoY1_halo:'float[:]', rhoY2_halo:'float[:]', Y1_halo:'float[:]', Y2_halo:'float[:]', 
+                            rho_haloghost:'float[:]', rhou_haloghost:'float[:]',rhov_haloghost:'float[:]',rhoE_haloghost:'float[:]',P_haloghost:'float[:]'
+                            ,T_haloghost:'float[:]',rhoY1_haloghost:'float[:]',rhoY2_haloghost:'float[:]',Y1_haloghost:'float[:]',Y2_haloghost:'float[:]'
+                            ,haloghostcenter:'float[:,:,:]', halonodes:'float[:]',center:'float[:,:]',R_gaz:'int32',T_in:'float', U_in:'float'):
+    
+    s_n = np.zeros(2)
+    for i in halonodes:
+        for j in range(len(haloghostcenter[i])):
+            if haloghostcenter[i][j][-1] != -1:
+                if haloghostcenter[i][j][-2] == 1:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                    
+                    y= center[cellghost][1]
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    if y>0.15 and y<0.35:                      
+                        rhou_haloghost[cellghost]   = U_in*rho_haloghost[cellghost]
+                        rhov_haloghost[cellghost]   = 0
+                        T_haloghost[cellghost]      = T_in
+                        Y1_haloghost[cellghost]      = 1
+                        Y2_haloghost[cellghost]      = 0
+                    else:
+                        rhou_haloghost[cellghost]   = U_in*rho_haloghost[cellghost]
+                        rhov_haloghost[cellghost]   = 0 
+                        T_haloghost[cellghost]      = 300
+                        Y1_haloghost[cellghost]      = 0
+                        Y2_haloghost[cellghost]      = 1
+
+                    
+                    P_haloghost[cellghost]      =R_gaz*T_haloghost[cellghost]*rho_haloghost[cellghost]  
+                    rhoY1_haloghost[cellghost]      =  rho_haloghost[cellghost] *Y1_haloghost[cellghost] 
+                    rhoY2_haloghost[cellghost]      = rho_haloghost[cellghost] *Y2_haloghost[cellghost] 
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                      
+
+                  
+                elif haloghostcenter[i][j][-2] == 2:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                    
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = rhov_halo[cellhalo]
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    T_haloghost[cellghost]      = T_halo[cellhalo]
+                    Y1_haloghost[cellghost]      = Y1_halo[cellhalo]
+                    Y2_haloghost[cellghost]      = Y2_halo[cellhalo]
+                    rhoY1_haloghost[cellghost]      = rhoY1_halo[cellhalo]
+                    rhoY2_haloghost[cellghost]      = rhoY2_halo[cellhalo]
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                      
+    
+                  
+                elif haloghostcenter[i][j][-2] == 3:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = int(haloghostcenter[i][j][-1])
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = -1*rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    T_haloghost[cellghost]      = T_halo[cellhalo]
+                    Y1_haloghost[cellghost]      = Y1_halo[cellhalo]
+                    Y2_haloghost[cellghost]      = Y2_halo[cellhalo]
+                    rhoY1_haloghost[cellghost]      = rhoY1_halo[cellhalo]
+                    rhoY2_haloghost[cellghost]      = rhoY2_halo[cellhalo]
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                      
+
+                    
+                elif haloghostcenter[i][j][-2] == 4:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = int(haloghostcenter[i][j][-1])
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = -1*rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    T_haloghost[cellghost]      = T_halo[cellhalo]
+                    Y1_haloghost[cellghost]      = Y1_halo[cellhalo]
+                    Y2_haloghost[cellghost]      = Y2_halo[cellhalo]
+                    rhoY1_haloghost[cellghost]      = rhoY1_halo[cellhalo]
+                    rhoY2_haloghost[cellghost]      = rhoY2_halo[cellhalo]
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                      
+    
+
+
+
+##############Droplet test################
+
+@njit
+def initialisation_Droplet(rho:'float[:]', rhou:'float[:]', rhov:'float[:]', rhoE:'float[:]',e_internal:'float[:]', P:'float[:]',T:'float[:]',Y1:'float[:]',Y2:'float[:]',rhoY1:'float[:]',rhoY2:'float[:]', center:'float[:,:]', gamma:'float', R_gaz:'float',T_0:'float'):
+   
+    nbelements = len(center)
+    
+    for i in range(nbelements):
+      #####oudit
+        rho[i]=1
+        rhou[i]=0
+        rhov[i]=0
+        T[i]=T_0
+        Y1[i]=0
+        Y2[i]=1
+        rhoY1[i]=0
+        rhoY2[i]=1
+        P[i]= rho[i]*T[i]*R_gaz
+        rhoE[i]=P[i]/(gamma-1) +0.5*(rhou[i]**2+rhov[i]**2)/(rho[i])
+        e_internal[i]=P[i]/((gamma-1)*rho[i] )
+         
+  
+
+
+
+
+#####################droplet test###############
+'''
+@njit
+def ghost_value_Droplet(rhog:'float[:]',Pg:'float[:]',rhoug:'float[:]',rhovg:'float[:]',
+                     rhoEg:'float[:]',Tg:'float[:]',rhoY1g:'float[:]',rhoY2g:'float[:]',Y1g:'float[:]',Y2g:'float[:]',
+                    rhoc:'float[:]',Pc:'float[:]',rhouc:'float[:]',rhovc:'float[:]',Tc:'float[:]',rhoY1c:'float[:]',rhoY2c:'float[:]',Y1c:'float[:]',Y2c:'float[:]',
+                     cellid:'int[:,:]', normal:'float[:,:]',mesure:'float[:]', center:'float[:,:]',faces_in:'float[:]',faces_out:'float[:]',faces_upper:'float[:]',faces_bottom:'float[:]',R_gaz:'int32',T_out:'float', U_in:'float', P_max:'float', T_0:'float'):
+    for i in faces_in:
+        #print("Hi I'm out of the circle")
+        x=center[i][0]
+        s_n=np.zeros(2)
+        if x>0.0:
+            
+            s_n[:] =  normal[i][0:2]
+            s_n[0]=s_n[0]/mesure[i]
+            s_n[1]=s_n[1]/mesure[i]
+            rhog[i]  = P_max/(R_gaz*T_0)
+            Y1g[i]    =1
+            Y2g[i]    = 0
+            ug=U_in*s_n[0]
+            vg=U_in*s_n[1]
+            rhoug[i] = ug*rhog[i]
+            rhovg[i] = vg*rhog[i]
+            Tg[i]    = T_0
+            Pg[i]    = Tg[i]*R_gaz*rhog[i]  
+            rhoY1g[i]    = rhog[i] *Y1g[i] 
+            rhoY2g[i]    =  rhog[i] *Y2g[i] 
+            rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+        else:
+            rhog[i]  = rhoc[cellid[i][0]] 
+            Y1g[i]    =Y1c[cellid[i][0]] 
+            Y2g[i]    = Y2c[cellid[i][0]] 
+            rhoug[i] = -1*rhouc[cellid[i][0]]
+            rhovg[i] = -1*rhovc[cellid[i][0]] 
+            Tg[i]    = Tc[cellid[i][0]] 
+            Pg[i]    = Pc[cellid[i][0]] 
+            rhoY1g[i]    = rhoY1c[cellid[i][0]]
+            rhoY2g[i]    =  rhoY2c[cellid[i][0]]
+            rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+        
+    for i in faces_out:
+        # print("x",center[i][0])
+        rhog[i]  = rhoc[cellid[i][0]] 
+        Y1g[i]    =Y1c[cellid[i][0]] 
+        Y2g[i]    = Y2c[cellid[i][0]] 
+        # à verfier la condition sur les vitesses
+        rhoug[i] = -1*rhouc[cellid[i][0]]
+        rhovg[i] = -1*rhovc[cellid[i][0]] 
+        Tg[i]    = T_out
+        # print(Tg[i])
+
+        Pg[i]    = Tg[i]*R_gaz*rhog[i]  
+        rhoY1g[i]    = rhoY1c[cellid[i][0]]
+        rhoY2g[i]    =  rhoY2c[cellid[i][0]]
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+       
+    for i in faces_upper:
+        rhog[i]  = rhoc[cellid[i][0]] 
+        Pg[i]    = Pc[cellid[i][0]]
+        Tg[i]    = Tc[cellid[i][0]]
+        rhoY1g[i]    = rhoY1c[cellid[i][0]]
+        rhoY2g[i]    = rhoY2c[cellid[i][0]]
+        Y1g[i]    = Y1c[cellid[i][0]]
+        Y2g[i]    = Y2c[cellid[i][0]]
+        rhoug[i] = rhouc[cellid[i][0]]
+        rhovg[i] = -1*rhovc[cellid[i][0]] 
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+
+    for i in faces_bottom:
+        rhog[i]  = rhoc[cellid[i][0]] 
+        Pg[i]    = Pc[cellid[i][0]]
+        Tg[i]    = Tc[cellid[i][0]]
+        rhoY1g[i]    = rhoY1c[cellid[i][0]]
+        rhoY2g[i]    = rhoY2c[cellid[i][0]]
+        Y1g[i]    = Y1c[cellid[i][0]]
+        Y2g[i]    = Y2c[cellid[i][0]]
+        rhoug[i] = rhouc[cellid[i][0]]
+        rhovg[i] = -1*rhovc[cellid[i][0]] 
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+    
+    
+     
+
+
+
+
+@njit
+def haloghost_value_Droplet(rho_halo:'float[:]',rhou_halo:'float[:]', rhov_halo:'float[:]', rhoE_halo:'float[:]', P_halo:'float[:]', 
+                           T_halo:'float[:]', rhoY1_halo:'float[:]', rhoY2_halo:'float[:]', Y1_halo:'float[:]', Y2_halo:'float[:]', 
+                            rho_haloghost:'float[:]', rhou_haloghost:'float[:]',rhov_haloghost:'float[:]',rhoE_haloghost:'float[:]',P_haloghost:'float[:]'
+                            ,T_haloghost:'float[:]',rhoY1_haloghost:'float[:]',rhoY2_haloghost:'float[:]',Y1_haloghost:'float[:]',Y2_haloghost:'float[:]'
+                            ,haloghostcenter:'float[:,:,:]', halonodes:'float[:]', haloghostfaceinfo:'float[:,:,:]',center:'float[:,:]',R_gaz:'int32',T_out:'float', U_in:'float', P_max:'float', T_0:'float'):
+    
+    s_n = np.zeros(2)
+    for i in halonodes:
+        for j in range(len(haloghostcenter[i])):
+            if haloghostcenter[i][j][-1] != -1:
+                if haloghostcenter[i][j][-2] == 1:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                    x= center[cellghost][0]
+
+                    if x>0.0:
+                        
+                        mesure = np.sqrt(haloghostfaceinfo[i][j][2]**2 + haloghostfaceinfo[i][j][3]**2) 
+
+                        s_n[0] = haloghostfaceinfo[i][j][2] / mesure
+                        s_n[1] = haloghostfaceinfo[i][j][3] / mesure    
+                        rho_haloghost[cellghost]    = P_max/(R_gaz*T_0)
+                        ug=U_in*s_n[0]
+                        vg=U_in*s_n[1]
+                        rhou_haloghost[cellghost]   = ug*rho_haloghost[cellghost]  
+                        rhov_haloghost[cellghost]   = vg*rho_haloghost[cellghost]  
+                        T_haloghost[cellghost]      = T_0
+                        Y1_haloghost[cellghost]      = 1
+                        Y2_haloghost[cellghost]      = 0
+                        
+                        P_haloghost[cellghost]      =R_gaz*T_haloghost[cellghost]*rho_haloghost[cellghost] 
+                        rhoY1_haloghost[cellghost]      =Y1_haloghost[cellghost]*rho_haloghost[cellghost] 
+                        rhoY2_haloghost[cellghost]      = Y2_haloghost[cellghost]*rho_haloghost[cellghost] 
+                        rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                    else:  
+                        
+                        rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                        rhou_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                        rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                        T_haloghost[cellghost]      = T_halo[cellhalo]
+                        Y1_haloghost[cellghost]      = Y1_halo[cellhalo]
+                        Y2_haloghost[cellghost]      = Y2_halo[cellhalo]
+                    
+                        P_haloghost[cellghost]      = P_halo[cellhalo]   
+                        rhoY1_haloghost[cellghost]      =  rhoY1_halo[cellhalo]
+                        rhoY2_haloghost[cellghost]      =rhoY2_halo[cellhalo]
+                        rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                            
+                 
+                elif haloghostcenter[i][j][-2] == 2:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                    
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = -1*rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                     
+                    T_haloghost[cellghost]      = T_out
+                    Y1_haloghost[cellghost]      = Y1_halo[cellhalo]
+                    Y2_haloghost[cellghost]      = Y2_halo[cellhalo]
+                    rhoY1_haloghost[cellghost]      = rhoY1_halo[cellhalo]
+                    rhoY2_haloghost[cellghost]      = rhoY2_halo[cellhalo]
+                    P_haloghost[cellghost]      = R_gaz*T_haloghost[cellghost]*rho_haloghost[cellghost] 
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                      
+    
+                  
+                elif haloghostcenter[i][j][-2] == 3:
+                    
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                           
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    T_haloghost[cellghost]      = T_halo[cellhalo]
+                    Y1_haloghost[cellghost]      = Y1_halo[cellhalo]
+                    Y2_haloghost[cellghost]      = Y2_halo[cellhalo]
+                    rhoY1_haloghost[cellghost]      = rhoY1_halo[cellhalo]
+                    rhoY2_haloghost[cellghost]      = rhoY2_halo[cellhalo]
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                      
+                elif haloghostcenter[i][j][-2] == 4:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = int(haloghostcenter[i][j][-1])
+                    
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    T_haloghost[cellghost]      = T_halo[cellhalo]
+                    Y1_haloghost[cellghost]      = Y1_halo[cellhalo]
+                    Y2_haloghost[cellghost]      = Y2_halo[cellhalo]
+                    rhoY1_haloghost[cellghost]      = rhoY1_halo[cellhalo]
+                    rhoY2_haloghost[cellghost]      = rhoY2_halo[cellhalo]
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                      
+'''   
+
+
+@njit
+def ghost_value_Droplet(rhog:'float[:]',Pg:'float[:]',rhoug:'float[:]',rhovg:'float[:]',
+                     rhoEg:'float[:]',Tg:'float[:]',rhoY1g:'float[:]',rhoY2g:'float[:]',Y1g:'float[:]',Y2g:'float[:]',
+                    rhoc:'float[:]',Pc:'float[:]',rhouc:'float[:]',rhovc:'float[:]',Tc:'float[:]',rhoY1c:'float[:]',rhoY2c:'float[:]',Y1c:'float[:]',Y2c:'float[:]',
+                     cellid:'int[:,:]', normal:'float[:,:]',mesure:'float[:]', center:'float[:,:]',faces_in:'float[:]',faces_out:'float[:]',faces_circle:'float[:]',faces_bottom_upper:'float[:]',R_gaz:'int32',T_out:'float', U_in:'float', P_max:'float', T_0:'float'):
+    for i in faces_in:
+        #print("Hi I'm out of the circle")
+        rhog[i]  = rhoc[cellid[i][0]] 
+        Y1g[i]    =Y1c[cellid[i][0]] 
+        Y2g[i]    = Y2c[cellid[i][0]] 
+        # à verfier la condition sur les vitesses
+        rhoug[i] = rhouc[cellid[i][0]]
+        rhovg[i] = -1*rhovc[cellid[i][0]] 
+        Tg[i]    = T_out
+        # print("in",Tg[i])
+
+
+        Pg[i]    = Tg[i]*R_gaz*rhog[i]  
+        rhoY1g[i]    = rhoY1c[cellid[i][0]]
+        rhoY2g[i]    =  rhoY2c[cellid[i][0]]
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+       
+    for i in faces_out:
+        # print("x",center[i][0])
+        rhog[i]  = rhoc[cellid[i][0]] 
+        Y1g[i]    =Y1c[cellid[i][0]] 
+        Y2g[i]    = Y2c[cellid[i][0]] 
+        # à verfier la condition sur les vitesses
+        rhoug[i] = rhouc[cellid[i][0]]
+        rhovg[i] = -1*rhovc[cellid[i][0]] 
+        Tg[i]    = T_out
+        # print("out",Tg[i])
+
+        Pg[i]    = Tg[i]*R_gaz*rhog[i]  
+        rhoY1g[i]    = rhoY1c[cellid[i][0]]
+        rhoY2g[i]    =  rhoY2c[cellid[i][0]]
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+       
+    for i in faces_circle :
+       #print("I'm in the circle")
+        x=center[i][0]
+        y=center[i][0]
+        #print("x:",x)
+        s_n=np.zeros(2)
+        s_n[:] =  normal[i][0:2]
+        s_n[0]=s_n[0]/mesure[i]
+        s_n[1]=s_n[1]/mesure[i]
+        # s_n[0] =( center[i][0] - 0.04)/np.sqrt(( center[i][0] - 0.04)**2+(center[i][1] - 0.05)**2)
+        # s_n[1] = (center[i][1] - 0.05)/np.sqrt(( center[i][0] - 0.04)**2+(center[i][1] - 0.05)**2)
+        
+        rhog[i]  = P_max/(R_gaz*T_0)
+        Y1g[i]    =1
+        Y2g[i]    = 0
+        # if x>=0.04:
+
+        #     ug=U_in*s_n[0]
+            
+        # else:
+        #     ug=-U_in*s_n[0]
+        
+        # if y>=0.05:
+        #     vg=U_in*s_n[1]
+        # else:
+             
+        #     vg=-U_in*s_n[1]
+
+            
+        ug=U_in*s_n[0]
+        vg=U_in*s_n[1]
+        rhoug[i] = ug*rhog[i]
+        rhovg[i] = vg*rhog[i]
+        Tg[i]    = T_0
+        Pg[i]    = Tg[i]*R_gaz*rhog[i]  
+        rhoY1g[i]    = rhog[i] *Y1g[i] 
+        rhoY2g[i]    =  rhog[i] *Y2g[i] 
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+
+    for i in faces_bottom_upper:
+        rhog[i]  = rhoc[cellid[i][0]] 
+        Pg[i]    = Pc[cellid[i][0]]
+        Tg[i]    = Tc[cellid[i][0]]
+        rhoY1g[i]    = rhoY1c[cellid[i][0]]
+        rhoY2g[i]    = rhoY2c[cellid[i][0]]
+        Y1g[i]    = Y1c[cellid[i][0]]
+        Y2g[i]    = Y2c[cellid[i][0]]
+        rhoug[i] = rhouc[cellid[i][0]]
+        rhovg[i] = -1*rhovc[cellid[i][0]] 
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+    
+
+     
+
+
+
+@njit
+def haloghost_value_Droplet(rho_halo:'float[:]',rhou_halo:'float[:]', rhov_halo:'float[:]', rhoE_halo:'float[:]', P_halo:'float[:]', 
+                           T_halo:'float[:]', rhoY1_halo:'float[:]', rhoY2_halo:'float[:]', Y1_halo:'float[:]', Y2_halo:'float[:]', 
+                            rho_haloghost:'float[:]', rhou_haloghost:'float[:]',rhov_haloghost:'float[:]',rhoE_haloghost:'float[:]',P_haloghost:'float[:]'
+                            ,T_haloghost:'float[:]',rhoY1_haloghost:'float[:]',rhoY2_haloghost:'float[:]',Y1_haloghost:'float[:]',Y2_haloghost:'float[:]'
+                            ,haloghostcenter:'float[:,:,:]', halonodes:'float[:]', haloghostfaceinfo:'float[:,:,:]',center:'float[:,:]',R_gaz:'int32',T_out:'float', U_in:'float', P_max:'float', T_0:'float'):
+    
+    s_n = np.zeros(2)
+    for i in halonodes:
+        for j in range(len(haloghostcenter[i])):
+            if haloghostcenter[i][j][-1] != -1:
+                if haloghostcenter[i][j][-2] == 1:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                  
+                  
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                     
+                    T_haloghost[cellghost]      = T_out
+                    Y1_haloghost[cellghost]      = Y1_halo[cellhalo]
+                    Y2_haloghost[cellghost]      = Y2_halo[cellhalo]
+                    rhoY1_haloghost[cellghost]      = rhoY1_halo[cellhalo]
+                    rhoY2_haloghost[cellghost]      = rhoY2_halo[cellhalo]
+                    P_haloghost[cellghost]      = R_gaz*T_haloghost[cellghost]*rho_haloghost[cellghost] 
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                      
+                elif haloghostcenter[i][j][-2] == 2:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                    
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                     
+                    T_haloghost[cellghost]      = T_out
+                    Y1_haloghost[cellghost]      = Y1_halo[cellhalo]
+                    Y2_haloghost[cellghost]      = Y2_halo[cellhalo]
+                    rhoY1_haloghost[cellghost]      = rhoY1_halo[cellhalo]
+                    rhoY2_haloghost[cellghost]      = rhoY2_halo[cellhalo]
+                    P_haloghost[cellghost]      = R_gaz*T_haloghost[cellghost]*rho_haloghost[cellghost] 
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                      
+    
+                  
+                elif haloghostcenter[i][j][-2] == 3:
+                      
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                    
+                    # print("halo x:",x)
+                    # s_n[0] =( center[i][0] - 0.04)/np.sqrt(( center[cellghost][0] - 0.04)**2+(center[i][1] - 0.05)**2)
+                    # s_n[1] = (center[i][1] - 0.05)/np.sqrt(( center[cellghost][0] - 0.04)**2+(center[i][1] - 0.05)**2)
+                    x=center[cellghost][0] 
+                    y=center[cellghost][1] 
+                 
+                    mesure = np.sqrt(haloghostfaceinfo[i][j][2]**2 + haloghostfaceinfo[i][j][3]**2) 
+
+                    s_n[0] = haloghostfaceinfo[i][j][2] / mesure
+                    s_n[1] = haloghostfaceinfo[i][j][3] / mesure    
+
+                    # if x>=0.04:
+
+                    #     ug=U_in*s_n[0]
+                        
+                    # else:
+                    #     ug=-U_in*s_n[0]
+                    
+                    # if y>=0.05:
+                    #     vg=U_in*s_n[1]
+                    # else:
+                        
+                    #     vg=-U_in*s_n[1]
+
+                    ug=U_in*s_n[0]
+                    vg=U_in*s_n[1]
+                        
+                    rho_haloghost[cellghost]    = P_max/(R_gaz*T_0)
+                    ug=U_in*s_n[0]
+                    vg=U_in*s_n[1]
+                    rhou_haloghost[cellghost]   = ug*rho_haloghost[cellghost]  
+                    rhov_haloghost[cellghost]   = vg*rho_haloghost[cellghost]  
+                    T_haloghost[cellghost]      = T_0
+                    Y1_haloghost[cellghost]      = 1
+                    Y2_haloghost[cellghost]      = 0
+                    
+                    P_haloghost[cellghost]      =R_gaz*T_haloghost[cellghost]*rho_haloghost[cellghost] 
+                    rhoY1_haloghost[cellghost]      =Y1_haloghost[cellghost]*rho_haloghost[cellghost] 
+                    rhoY2_haloghost[cellghost]      = Y2_haloghost[cellghost]*rho_haloghost[cellghost] 
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                      
+                    
+                    
+                elif haloghostcenter[i][j][-2] == 4:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = int(haloghostcenter[i][j][-1])
+                    
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    T_haloghost[cellghost]      = T_halo[cellhalo]
+                    Y1_haloghost[cellghost]      = Y1_halo[cellhalo]
+                    Y2_haloghost[cellghost]      = Y2_halo[cellhalo]
+                    rhoY1_haloghost[cellghost]      = rhoY1_halo[cellhalo]
+                    rhoY2_haloghost[cellghost]      = rhoY2_halo[cellhalo]
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                      
+
+
+
+
+
+############dumi droplet##################
+@njit
+def ghost_value_Droplet2(rhog:'float[:]',Pg:'float[:]',rhoug:'float[:]',rhovg:'float[:]',
+                     rhoEg:'float[:]',Tg:'float[:]',rhoY1g:'float[:]',rhoY2g:'float[:]',Y1g:'float[:]',Y2g:'float[:]',
+                    rhoc:'float[:]',Pc:'float[:]',rhouc:'float[:]',rhovc:'float[:]',Tc:'float[:]',rhoY1c:'float[:]',rhoY2c:'float[:]',Y1c:'float[:]',Y2c:'float[:]',
+                     cellid:'int[:,:]', normal:'float[:,:]',mesure:'float[:]', center:'float[:,:]',faces_in:'float[:]',faces_out:'float[:]',faces_upper:'float[:]',faces_bottom:'float[:]',R_gaz:'int32',T_out:'float', U_in:'float', P_max:'float', T_0:'float'):
+    s_n=np.zeros(2)
+    for i in faces_in:
+        x=center[i][0]
+        if x>0.0:
+            s_n[:] =  normal[i][0:2]
+            s_n[0]=s_n[0]/mesure[i]
+            s_n[1]=s_n[1]/mesure[i]
+            rhog[i]  = P_max/(R_gaz*T_0)
+            Y1g[i]    =1
+            Y2g[i]    = 0
+        
+            ug=U_in*s_n[0]
+            vg=U_in*s_n[1]
+            rhoug[i] = ug*rhog[i]
+            rhovg[i] = vg*rhog[i]
+            Tg[i]    = T_0
+            Pg[i]    = Tg[i]*R_gaz*rhog[i]  
+            rhoY1g[i]    = rhog[i] *Y1g[i] 
+            rhoY2g[i]    =  rhog[i] *Y2g[i] 
+            rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+ 
+        else:
+            rhog[i]  = rhoc[cellid[i][0]] 
+            Y1g[i]    =Y1c[cellid[i][0]] 
+            Y2g[i]    = Y2c[cellid[i][0]] 
+            # à verfier la condition sur les vitesses
+            rhoug[i] = -1*rhouc[cellid[i][0]]
+            rhovg[i] = -1*rhovc[cellid[i][0]] 
+            Tg[i]    = Tc[cellid[i][0]]
+            # print(Tg[i])
+
+            Pg[i]    = Tg[i]*R_gaz*rhog[i]  
+            rhoY1g[i]    = rhoY1c[cellid[i][0]]
+            rhoY2g[i]    =  rhoY2c[cellid[i][0]]
+            rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+        
+    for i in faces_out:
+        # print("x",center[i][0])
+        rhog[i]  = rhoc[cellid[i][0]] 
+        Y1g[i]    =Y1c[cellid[i][0]] 
+        Y2g[i]    = Y2c[cellid[i][0]] 
+        # à verfier la condition sur les vitesses
+        rhoug[i] = -1*rhouc[cellid[i][0]] 
+        rhovg[i] = -1*rhovc[cellid[i][0]] 
+        Tg[i]    = T_out
+        # print(Tg[i])
+
+        Pg[i]    = Tg[i]*R_gaz*rhog[i]  
+        rhoY1g[i]    = rhoY1c[cellid[i][0]] 
+        rhoY2g[i]    = rhoY2c[cellid[i][0]] 
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+       
+    for i in faces_upper :
+        rhog[i]  = rhoc[cellid[i][0]] 
+        Pg[i]    = Pc[cellid[i][0]]
+        Tg[i]    = Tc[cellid[i][0]]
+        rhoY1g[i]    = rhoY1c[cellid[i][0]]
+        rhoY2g[i]    = rhoY2c[cellid[i][0]]
+        Y1g[i]    = Y1c[cellid[i][0]]
+        Y2g[i]    = Y2c[cellid[i][0]]
+        rhoug[i] =  rhouc[cellid[i][0]]
+        rhovg[i] = -1*rhovc[cellid[i][0]] 
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+    
+    for i in faces_bottom:
+        rhog[i]  = rhoc[cellid[i][0]] 
+        Pg[i]    = Pc[cellid[i][0]]
+        Tg[i]    = Tc[cellid[i][0]]
+        rhoY1g[i]    = rhoY1c[cellid[i][0]]
+        rhoY2g[i]    = rhoY2c[cellid[i][0]]
+        Y1g[i]    = Y1c[cellid[i][0]]
+        Y2g[i]    = Y2c[cellid[i][0]]
+        rhoug[i] =  rhouc[cellid[i][0]]
+        rhovg[i] = -1*rhovc[cellid[i][0]] 
+        rhoEg[i]=Pg[i]/(1.4-1) +0.5*(rhoug[i]**2+rhovg[i]**2)/(rhog[i])
+    
+
+
+@njit
+def haloghost_value_Droplet2(rho_halo:'float[:]',rhou_halo:'float[:]', rhov_halo:'float[:]', rhoE_halo:'float[:]', P_halo:'float[:]', 
+                           T_halo:'float[:]', rhoY1_halo:'float[:]', rhoY2_halo:'float[:]', Y1_halo:'float[:]', Y2_halo:'float[:]', 
+                            rho_haloghost:'float[:]', rhou_haloghost:'float[:]',rhov_haloghost:'float[:]',rhoE_haloghost:'float[:]',P_haloghost:'float[:]'
+                            ,T_haloghost:'float[:]',rhoY1_haloghost:'float[:]',rhoY2_haloghost:'float[:]',Y1_haloghost:'float[:]',Y2_haloghost:'float[:]'
+                            ,haloghostcenter:'float[:,:,:]', halonodes:'float[:]', haloghostfaceinfo:'float[:,:,:]',center:'float[:,:]',R_gaz:'int32',T_out:'float', U_in:'float', P_max:'float', T_0:'float'):
+    
+    s_n = np.zeros(2)
+    for i in halonodes:
+        for j in range(len(haloghostcenter[i])):
+            if haloghostcenter[i][j][-1] != -1:
+                if haloghostcenter[i][j][-2] == 1:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+
+
+                    x=center[cellghost][0] 
+                    if x>0.0:
+                        mesure = np.sqrt(haloghostfaceinfo[i][j][2]**2 + haloghostfaceinfo[i][j][3]**2) 
+
+                        s_n[0] = haloghostfaceinfo[i][j][2] / mesure
+                        s_n[1] = haloghostfaceinfo[i][j][3] / mesure    
+                        ug=U_in*s_n[0]
+                        vg=U_in*s_n[1]
+                            
+                        rho_haloghost[cellghost]    = P_max/(R_gaz*T_0)
+                        ug=U_in*s_n[0]
+                        vg=U_in*s_n[1]
+                        rhou_haloghost[cellghost]   = ug*rho_haloghost[cellghost]  
+                        rhov_haloghost[cellghost]   = vg*rho_haloghost[cellghost]  
+                        T_haloghost[cellghost]      = T_0
+                        Y1_haloghost[cellghost]      = 1
+                        Y2_haloghost[cellghost]      = 0
+                        
+                        P_haloghost[cellghost]      =R_gaz*T_haloghost[cellghost]*rho_haloghost[cellghost] 
+                        rhoY1_haloghost[cellghost]      =Y1_haloghost[cellghost]*rho_haloghost[cellghost] 
+                        rhoY2_haloghost[cellghost]      = Y2_haloghost[cellghost]*rho_haloghost[cellghost] 
+                        rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                    else: 
+                        rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                        rhou_haloghost[cellghost]   = -1*rhou_halo[cellhalo]
+                        rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                        # rhou_haloghost[cellghost]   = 0
+                        # rhov_haloghost[cellghost]   =0
+                        
+                        T_haloghost[cellghost]      = T_halo[cellhalo]
+                        Y1_haloghost[cellghost]      = Y1_halo[cellhalo]
+                        Y2_haloghost[cellghost]      = Y2_halo[cellhalo]
+                        rhoY1_haloghost[cellghost]      = rhoY1_halo[cellhalo]
+                        rhoY2_haloghost[cellghost]      = rhoY2_halo[cellhalo]
+                        P_haloghost[cellghost]      = R_gaz*T_haloghost[cellghost]*rho_haloghost[cellghost] 
+                        rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                        
+                elif haloghostcenter[i][j][-2] == 2:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                    
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = -1*rhou_halo[cellhalo]   
+                    rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                     
+                    T_haloghost[cellghost]      = T_out
+                    Y1_haloghost[cellghost]      = Y1_halo[cellhalo]
+                    Y2_haloghost[cellghost]      = Y2_halo[cellhalo]
+                    rhoY1_haloghost[cellghost]      = rhoY1_halo[cellhalo]
+                    rhoY2_haloghost[cellghost]      = rhoY2_halo[cellhalo]
+                    P_haloghost[cellghost]      = R_gaz*T_haloghost[cellghost]*rho_haloghost[cellghost] 
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                      
+    
+                  
+                elif haloghostcenter[i][j][-2] == 3:
+                      
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = np.int32(haloghostcenter[i][j][-1])
+                           
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    T_haloghost[cellghost]      = T_halo[cellhalo]
+                    Y1_haloghost[cellghost]      = Y1_halo[cellhalo]
+                    Y2_haloghost[cellghost]      = Y2_halo[cellhalo]
+                    rhoY1_haloghost[cellghost]      = rhoY1_halo[cellhalo]
+                    rhoY2_haloghost[cellghost]      = rhoY2_halo[cellhalo]
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                
+                elif haloghostcenter[i][j][-2] == 4:
+                    cellhalo  = np.int32(haloghostcenter[i][j][-3])
+                    cellghost = int(haloghostcenter[i][j][-1])
+                    
+                    rho_haloghost[cellghost]    = rho_halo[cellhalo]
+                    rhou_haloghost[cellghost]   = rhou_halo[cellhalo]
+                    rhov_haloghost[cellghost]   = -1*rhov_halo[cellhalo]
+                    # rhou_haloghost[cellghost]   = 0
+                    # rhov_haloghost[cellghost]   =0
+                    P_haloghost[cellghost]      = P_halo[cellhalo]
+                    T_haloghost[cellghost]      = T_halo[cellhalo]
+                    Y1_haloghost[cellghost]      = Y1_halo[cellhalo]
+                    Y2_haloghost[cellghost]      = Y2_halo[cellhalo]
+                    rhoY1_haloghost[cellghost]      = rhoY1_halo[cellhalo]
+                    rhoY2_haloghost[cellghost]      = rhoY2_halo[cellhalo]
+                    rhoE_haloghost[cellghost]  = 0.5*(rhou_haloghost[cellghost]**2 + rhov_haloghost[cellghost]**2)/rho_haloghost[cellghost] + P_haloghost[cellghost]/(1.4-1)  
+                      
